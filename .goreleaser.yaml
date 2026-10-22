@@ -1,0 +1,49 @@
+# GoReleaser v2 config. Release assets: lookout_linux_{amd64,arm64}.tar.gz
+# (each holding only the lookout binary), their .minisig signatures,
+# checksums.txt, and install.sh + lookout.plg rendered into
+# build/release-extra by scripts/render-release-files.sh.
+#
+# Env: MINISIGN_PUBLIC_KEY (embedded into the binary for self-update),
+# MINISIGN_KEY_FILE and MINISIGN_PASSWORD (used by minisign to sign).
+version: 2
+project_name: lookout
+
+builds:
+  - main: ./cmd/lookout
+    binary: lookout
+    env: [CGO_ENABLED=0]
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/pentacore/lookout/internal/buildinfo.Version={{ .Version }} -X github.com/pentacore/lookout/internal/buildinfo.MinisignPublicKey={{ .Env.MINISIGN_PUBLIC_KEY }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    files: [none*]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# The trusted comment must be exactly "lookout {version} {asset}": the agent's
+# self-update (internal/selfupdate) rejects any other, which binds each
+# signature to one version and one arch. Sign args get no artifact template
+# fields, so the asset name is the base of ${artifact} (its dist path).
+# packaging/test/release_test.sh checks the result.
+signs:
+  - id: minisign
+    artifacts: archive
+    cmd: minisign
+    signature: "${artifact}.minisig"
+    stdin: "{{ .Env.MINISIGN_PASSWORD }}\n"
+    args: ["-S", "-s", "{{ .Env.MINISIGN_KEY_FILE }}", "-m", "${artifact}", "-x", "${signature}", "-t", 'lookout {{ .Version }} {{ base "${artifact}" }}']
+
+release:
+  github:
+    owner: pentacore
+    name: lookout
+  prerelease: auto
+  extra_files:
+    - glob: ./build/release-extra/*

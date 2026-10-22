@@ -67,3 +67,49 @@ The agent reads a YAML file: `/etc/lookout/lookout.yaml` on Debian/Ubuntu and `/
 Unknown top-level keys, such as a misspelled `platfrom_url`, do not stop the agent. They are logged as a warning and ignored.
 
 ## Releases and signing
+
+Releases are built by GoReleaser in the `Release` workflow (`.github/workflows/release.yml`) when a `v*` tag is pushed. Each release has these assets:
+
+| Asset | What it is |
+| --- | --- |
+| `lookout_linux_amd64.tar.gz`, `lookout_linux_arm64.tar.gz` | The static `lookout` binary, alone in the archive. |
+| `lookout_linux_{amd64,arm64}.tar.gz.minisig` | The minisign signature of each archive. |
+| `checksums.txt` | SHA-256 of both archives. |
+| `install.sh`, `lookout.plg` | The Debian/Ubuntu install script and the Unraid plugin, with the version and public key filled in. |
+
+### One-time setup (repository owner)
+
+1. Create the **public** GitHub repo `pentacore/lookout`. It must be public because agents call the GitHub releases API and download assets without authentication. Add a LICENSE of your choice.
+2. Generate the signing key: `go install aead.dev/minisign/cmd/minisign@v0.3.0 && minisign -G -p lookout.pub -s lookout.key` (enter a password).
+3. Add repo **secrets** `MINISIGN_SECRET_KEY` (full contents of `lookout.key`) and `MINISIGN_PASSWORD`. Add repo **variable** `MINISIGN_PUBLIC_KEY` (the second line of `lookout.pub`, the base64 `RW…` string). Store `lookout.key` offline.
+4. Add the remote, push `main`, then tag `v0.1.0` and push the tag to cut the first release (see below).
+5. Optional: put the public key in the repo description or this README, so first installs can be checked out of band.
+
+### Cutting a release
+
+```sh
+git tag vX.Y.Z && git push --tags
+```
+
+The tag must be `vX.Y.Z` or `vX.Y.Z-prerelease` (such as `v0.2.0-rc.1`). A tag with a pre-release suffix becomes a GitHub pre-release, which agents ignore because they only look at the latest full release. The workflow:
+
+1. Refuses any other tag format.
+2. Signs a test file with the secret key and password, and verifies it with `MINISIGN_PUBLIC_KEY`. If the secrets and the variable don't belong together, the release stops here, before anything is built or published.
+3. Renders `install.sh` and `lookout.plg`, then builds, signs and publishes the release with GoReleaser. The public key and the version are built into the binary.
+4. After publishing, verifies each archive with `minisign` and with the agent's own verification code (`go test -tags release` in `internal/selfupdate`).
+
+To try the whole pipeline locally with a throwaway key (needs Go 1.27.1 or later; it rewrites `dist/` and `build/release-extra/`):
+
+```sh
+bash packaging/test/release_test.sh
+```
+
+### What the agent verifies
+
+When a newer release than its own version is out, the agent downloads the archive for its architecture and its `.minisig` and checks:
+
+- The signature is valid for the public key built into the running binary.
+- The signature's trusted comment is exactly `lookout {version} {asset}`, for example `lookout 0.2.0 lookout_linux_amd64.tar.gz`. The trusted comment is covered by the signature, but the release tag is not. So this check is what stops an attacker who controls the download from serving an older signed release (a downgrade) or the other architecture's archive under this release's name.
+- The archive holds exactly one `lookout` entry, a regular file, and the new binary reports the expected version when run with `lookout version`.
+
+A build without an embedded public key, such as a local `go build` or a `dev` build, never self-updates.

@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      MINISIGN_PUBLIC_KEY: ${{ vars.MINISIGN_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Check the tag is vX.Y.Z or vX.Y.Z-prerelease
+        run: |
+          if ! [[ $GITHUB_REF_NAME =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME is not vX.Y.Z or vX.Y.Z-prerelease"
+            exit 1
+          fi
+
+      - name: Install minisign
+        run: |
+          go install aead.dev/minisign/cmd/minisign@v0.3.0
+          echo "$(go env GOPATH)/bin" >>"$GITHUB_PATH"
+
+      - name: Write the signing key
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          test -n "$MINISIGN_SECRET_KEY" || { echo "::error::secret MINISIGN_SECRET_KEY is not set"; exit 1; }
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" >"$RUNNER_TEMP/minisign.key"
+          chmod 0600 "$RUNNER_TEMP/minisign.key"
+          echo "MINISIGN_KEY_FILE=$RUNNER_TEMP/minisign.key" >>"$GITHUB_ENV"
+
+      - name: Check the public key variable is set
+        run: test -n "$MINISIGN_PUBLIC_KEY" || { echo "::error::variable MINISIGN_PUBLIC_KEY is not set"; exit 1; }
+
+      # Fails before anything is built or published when the secret key, its
+      # password and the public key variable don't belong together.
+      - name: Check the signing key matches the public key
+        env:
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          printf 'lookout release key check %s\n' "$GITHUB_REF_NAME" >"$RUNNER_TEMP/sanity.txt"
+          printf '%s\n' "$MINISIGN_PASSWORD" |
+            minisign -S -s "$MINISIGN_KEY_FILE" -m "$RUNNER_TEMP/sanity.txt" -x "$RUNNER_TEMP/sanity.txt.minisig"
+          minisign -V -P "$MINISIGN_PUBLIC_KEY" -m "$RUNNER_TEMP/sanity.txt" -x "$RUNNER_TEMP/sanity.txt.minisig"
+
+      - name: Render install.sh and lookout.plg
+        run: scripts/render-release-files.sh "${GITHUB_REF_NAME#v}" build/release-extra
+
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: v2.18.3
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MINISIGN_PUBLIC_KEY: ${{ vars.MINISIGN_PUBLIC_KEY }}
+          MINISIGN_KEY_FILE: ${{ env.MINISIGN_KEY_FILE }}
+
+      # The same checks a running agent makes before it self-updates: each
+      # archive's signature, its exact trusted comment, and the embedded key.
+      - name: Verify the published archives
+        run: |
+          shopt -s nullglob
+          archives=(dist/*.tar.gz)
+          test "${#archives[@]}" -eq 2 || { echo "::error::want 2 archives in dist, got ${#archives[@]}"; exit 1; }
+          for archive in "${archives[@]}"; do
+            minisign -V -P "$MINISIGN_PUBLIC_KEY" -m "$archive" -x "$archive.minisig"
+          done
+          LOOKOUT_DIST="$PWD/dist" LOOKOUT_RELEASE_VERSION="${GITHUB_REF_NAME#v}" \
+            go test -tags release -count=1 -run '^TestReleaseArtifacts$' ./internal/selfupdate
