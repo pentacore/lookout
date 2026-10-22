@@ -98,9 +98,11 @@ func fileFreshness(_ context.Context, env Env, raw json.RawMessage) Outcome {
 }
 
 // newestMatch returns the most recently modified regular file directly inside
-// hostDir whose name matches pattern. Symlinks are followed, and entries that
-// cannot be stat'ed (broken links) are skipped. The returned name is under
-// logicalDir. Ties go to the first name in directory order.
+// hostDir whose name matches pattern. Symlinks are followed and broken links
+// (whose target does not exist) are skipped; any other stat failure is an
+// error, as skipping the entry could report an older file as the newest. The
+// returned name is under logicalDir. Ties go to the first name in directory
+// order.
 func newestMatch(hostDir, logicalDir, pattern string) (string, time.Time, bool, error) {
 	if _, err := filepath.Match(pattern, ""); err != nil {
 		return "", time.Time{}, false, fmt.Errorf("invalid pattern %q: %w", pattern, err)
@@ -124,7 +126,13 @@ func newestMatch(hostDir, logicalDir, pattern string) (string, time.Time, bool, 
 		}
 
 		info, err := os.Stat(filepath.Join(hostDir, entry.Name()))
-		if err != nil || !info.Mode().IsRegular() {
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return "", time.Time{}, false, fmt.Errorf("cannot stat %s: %w", filepath.Join(logicalDir, entry.Name()), err)
+		}
+		if !info.Mode().IsRegular() {
 			continue
 		}
 

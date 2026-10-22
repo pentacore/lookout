@@ -109,6 +109,7 @@ func ReadLoad(root string) ([3]float64, error) {
 }
 
 // ReadMemory returns memory and swap figures in bytes from /proc/meminfo.
+// MemTotal and MemAvailable are required; missing swap fields read as 0.
 func ReadMemory(root string) (wire.Memory, error) {
 	file, err := os.Open(filepath.Join(root, "proc/meminfo"))
 	if err != nil {
@@ -123,7 +124,7 @@ func ReadMemory(root string) (wire.Memory, error) {
 		"SwapTotal":    &memory.SwapTotalBytes,
 		"SwapFree":     &memory.SwapFreeBytes,
 	}
-	found := 0
+	found := map[string]bool{}
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -141,13 +142,15 @@ func ReadMemory(root string) (wire.Memory, error) {
 			return wire.Memory{}, fmt.Errorf("proc/meminfo: %s: %w", key, err)
 		}
 		*target = kilobytes * 1024
-		found++
+		found[key] = true
 	}
 	if err := scanner.Err(); err != nil {
 		return wire.Memory{}, err
 	}
-	if found == 0 {
-		return wire.Memory{}, errors.New("proc/meminfo: no memory fields found")
+	for _, key := range []string{"MemTotal", "MemAvailable"} {
+		if !found[key] {
+			return wire.Memory{}, fmt.Errorf("proc/meminfo: %s not found", key)
+		}
 	}
 	return memory, nil
 }

@@ -3,6 +3,7 @@ package collect
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pentacore/lookout/internal/wire"
@@ -179,6 +180,28 @@ func TestReadMemoryErrors(t *testing.T) {
 	writeProc(t, root, "proc/meminfo", "MemTotal: lots kB\n")
 	if _, err := ReadMemory(root); err == nil {
 		t.Error("malformed value: expected error")
+	}
+}
+
+// A missing MemTotal or MemAvailable must be an error, not 0: a zero
+// available figure would look like memory exhaustion to the platform.
+func TestReadMemoryRequiresTotalAndAvailable(t *testing.T) {
+	tests := []struct {
+		name, meminfo, want string
+	}{
+		{"no MemAvailable", "MemTotal: 1000 kB\nMemFree: 10 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n", "MemAvailable"},
+		{"no MemTotal", "MemFree: 10 kB\nMemAvailable: 500 kB\n", "MemTotal"},
+		{"only swap", "SwapTotal: 200 kB\nSwapFree: 100 kB\n", "MemTotal"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeProc(t, root, "proc/meminfo", tt.meminfo)
+			got, err := ReadMemory(root)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ReadMemory = %+v, %v; want an error naming %s", got, err, tt.want)
+			}
+		})
 	}
 }
 

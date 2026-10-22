@@ -177,6 +177,23 @@ func TestFileFreshness(t *testing.T) {
 			},
 		},
 		{
+			// A stat error other than "does not exist" is reported, not
+			// skipped: skipping it could report an older file as the newest.
+			checkCase: checkCase{
+				name:         "unstattable entry is an error",
+				params:       freshnessParams,
+				wantStatus:   wire.StatusError,
+				wantContains: "cannot stat /backups/loop.tar",
+			},
+			setup: func(t *testing.T, env Env) {
+				writeAged(t, env, "/backups/b.tar", hours(30))
+
+				if err := os.Symlink("loop.tar", env.HostPath("/backups/loop.tar")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
 			checkCase: checkCase{
 				name:         "path is a file",
 				params:       `{"path":"/backups/b.tar","pattern":"*.zip","warn_hours":26,"crit_hours":48}`,
