@@ -1,0 +1,30 @@
+#!/bin/bash
+# Enroll this Unraid server with the platform, then restart the agent so it
+# reports with the new credentials right away:
+#   enroll PLATFORM_URL ENROLLMENT_TOKEN
+# Called by the Lookout settings page (include/enroll.php) and usable from a
+# shell. The token is never printed.
+LOOKOUT_BIN="${LOOKOUT_BIN:-/usr/local/bin/lookout}"
+LOOKOUT_CONFIG="${LOOKOUT_CONFIG:-/boot/config/plugins/lookout/lookout.yaml}"
+LOOKOUT_RC="${LOOKOUT_RC:-/etc/rc.d/rc.lookout}"
+
+url="${1-}"
+token="${2-}"
+
+# https:// for any host; plain http:// only for loopback hosts, like the agent.
+if ! [[ $url =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[[:graph:]]*)?$ ||
+	$url =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/[[:graph:]]*)?$ ]]; then
+	echo "invalid platform URL"
+	exit 1
+fi
+if ! [[ $token =~ ^[A-Za-z0-9]{32}$ ]]; then
+	echo "invalid enrollment token"
+	exit 1
+fi
+
+out=$("$LOOKOUT_BIN" enroll --config "$LOOKOUT_CONFIG" --url "$url" --token "$token" --force 2>&1)
+status=$?
+# lookout already redacts the token; this guards against any echo of it.
+printf '%s\n' "${out//"$token"/[redacted]}"
+[ "$status" -eq 0 ] || exit 1
+"$LOOKOUT_RC" restart

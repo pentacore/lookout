@@ -1,0 +1,21 @@
+#!/bin/bash
+# Keeps `lookout run` alive on Unraid, which has no service manager: restarts
+# the agent LOOKOUT_RESTART_DELAY seconds after it exits and sends its output
+# to syslog (tag lookout). TERM or INT stops the agent and then this loop.
+LOOKOUT_BIN="${LOOKOUT_BIN:-/usr/local/bin/lookout}"
+LOOKOUT_CONFIG="${LOOKOUT_CONFIG:-/boot/config/plugins/lookout/lookout.yaml}"
+LOOKOUT_RESTART_DELAY="${LOOKOUT_RESTART_DELAY:-5}"
+
+stop=0
+child=
+trap 'stop=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT
+while [ "$stop" -eq 0 ]; do
+	"$LOOKOUT_BIN" run --config "$LOOKOUT_CONFIG" > >(logger -t lookout) 2>&1 &
+	child=$!
+	wait "$child"
+	[ "$stop" -eq 1 ] && wait "$child" 2>/dev/null
+	child=
+	[ "$stop" -eq 1 ] && break
+	sleep "$LOOKOUT_RESTART_DELAY" &
+	wait $!
+done

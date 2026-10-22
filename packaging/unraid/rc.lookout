@@ -1,0 +1,78 @@
+#!/bin/bash
+# Start/stop the lookout agent on Unraid: /etc/rc.d/rc.lookout start|stop|restart|status
+# The pidfile holds the PID of the supervisor, which restarts the agent when it
+# exits and stops it on TERM.
+PIDFILE="${LOOKOUT_PIDFILE:-/var/run/lookout.pid}"
+SUPERVISE="${LOOKOUT_SUPERVISE:-/usr/local/emhttp/plugins/lookout/scripts/supervise}"
+STOP_TIMEOUT="${LOOKOUT_STOP_TIMEOUT:-10}"
+
+# running_pid prints the supervisor PID and succeeds while it is alive.
+running_pid() {
+	local pid
+	[ -f "$PIDFILE" ] || return 1
+	pid=$(cat "$PIDFILE" 2>/dev/null)
+	[[ $pid =~ ^[0-9]+$ ]] || return 1
+	kill -0 "$pid" 2>/dev/null || return 1
+	echo "$pid"
+}
+
+start() {
+	local pid
+	if pid=$(running_pid); then
+		echo "lookout is already running (pid $pid)"
+		return 0
+	fi
+	# setsid detaches the supervisor from the caller (the webGUI or the plugin
+	# manager). macOS has no setsid; plain nohup keeps the local tests working.
+	if command -v setsid >/dev/null 2>&1; then
+		setsid nohup "$SUPERVISE" >/dev/null 2>&1 &
+	else
+		nohup "$SUPERVISE" >/dev/null 2>&1 &
+	fi
+	echo $! >"$PIDFILE"
+	echo "lookout started"
+}
+
+stop() {
+	local pid i
+	if ! pid=$(running_pid); then
+		rm -f "$PIDFILE"
+		echo "lookout is not running"
+		return 0
+	fi
+	kill -TERM "$pid" 2>/dev/null
+	for ((i = 0; i < STOP_TIMEOUT * 10; i++)); do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 0.1
+	done
+	if kill -0 "$pid" 2>/dev/null; then
+		pkill -KILL -P "$pid" 2>/dev/null
+		kill -KILL "$pid" 2>/dev/null
+	fi
+	rm -f "$PIDFILE"
+	echo "lookout stopped"
+}
+
+status() {
+	local pid
+	if pid=$(running_pid); then
+		echo "lookout is running (pid $pid)"
+		return 0
+	fi
+	echo "lookout is stopped"
+	return 3
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+restart)
+	stop
+	start
+	;;
+status) status ;;
+*)
+	echo "usage: $0 start|stop|restart|status" >&2
+	exit 1
+	;;
+esac

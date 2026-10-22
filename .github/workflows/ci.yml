@@ -36,6 +36,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libxml2-utils
       - run: shellcheck -s sh packaging/install.sh
+      - run: shellcheck packaging/unraid/rc.lookout packaging/unraid/supervise packaging/unraid/enroll packaging/unraid/plg-install.sh packaging/unraid/plg-remove.sh
       - run: shellcheck -x scripts/*.sh packaging/test/*.sh
+      - run: php -l packaging/unraid/enroll.php && sed '1,/^---$/d' packaging/unraid/Lookout.page | php -l
       - run: sh packaging/test/install_test.sh
+      - run: bash packaging/test/supervise_test.sh
+      - run: bash packaging/test/unraid_test.sh
+      - name: xmllint rendered lookout.plg
+        run: |
+          MINISIGN_PUBLIC_KEY=RWQci scripts/render-release-files.sh 0.0.0 build/ci-render
+          xmllint --noout build/ci-render/lookout.plg

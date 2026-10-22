@@ -1,0 +1,87 @@
+Menu="Utilities"
+Title="Lookout"
+Icon="eye"
+Markdown="false"
+---
+<?php
+/* Status and enrollment of the lookout agent. Every value printed here goes
+ * through htmlspecialchars, and the enrollment token is never printed. */
+$lookout_root = defined('LOOKOUT_TEST_ROOT') ? LOOKOUT_TEST_ROOT : '';
+$lookout_dir = "$lookout_root/boot/config/plugins/lookout";
+
+$lookout_h = function ($value) {
+  return htmlspecialchars((string) $value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+};
+$lookout_run = function ($path, $arg) {
+  return trim((string) shell_exec(escapeshellarg($path).' '.escapeshellarg($arg).' 2>/dev/null'));
+};
+$lookout_read = function ($path) {
+  return is_file($path) && is_readable($path) ? (string) file_get_contents($path) : '';
+};
+$lookout_field = function ($path, $key) use ($lookout_read) {
+  $data = json_decode($lookout_read($path), true);
+  return is_array($data) && isset($data[$key]) && is_string($data[$key]) ? $data[$key] : '';
+};
+
+$lookout_status = $lookout_run("$lookout_root/etc/rc.d/rc.lookout", 'status');
+$lookout_version = $lookout_run("$lookout_root/usr/local/bin/lookout", 'version');
+$lookout_uuid = $lookout_field("$lookout_dir/state/credentials.json", 'server_uuid');
+$lookout_success = $lookout_field("$lookout_root/run/lookout/status.json", 'last_success_at');
+$lookout_error = $lookout_field("$lookout_root/run/lookout/status.json", 'last_error');
+$lookout_url = '';
+if (preg_match('/^platform_url:[ \t]*(.*?)[ \t]*$/m', $lookout_read("$lookout_dir/lookout.yaml"), $lookout_match)) {
+  $lookout_url = trim($lookout_match[1], "\"'");
+}
+?>
+<dl>
+  <dt>Agent:</dt>
+  <dd><?=$lookout_h($lookout_status ?: 'unknown')?></dd>
+  <dt>Version:</dt>
+  <dd><?=$lookout_h($lookout_version ?: 'not installed')?></dd>
+  <dt>Server UUID:</dt>
+  <dd><?=$lookout_h($lookout_uuid ?: 'not enrolled')?></dd>
+  <dt>Platform URL:</dt>
+  <dd><?=$lookout_h($lookout_url ?: 'not set')?></dd>
+  <dt>Last successful report:</dt>
+  <dd><?=$lookout_h($lookout_success ?: 'never')?></dd>
+  <dt>Last error:</dt>
+  <dd><?=$lookout_h($lookout_error ?: 'none')?></dd>
+</dl>
+
+<form id="lookout-enroll" method="POST" action="/plugins/lookout/include/enroll.php" autocomplete="off">
+<input type="hidden" name="csrf_token" value="<?=$lookout_h($var['csrf_token'] ?? '')?>">
+<dl>
+  <dt>Platform URL:</dt>
+  <dd><input type="url" name="url" value="<?=$lookout_h($lookout_url)?>" placeholder="https://media.example.com" required></dd>
+  <dt>Enrollment token:</dt>
+  <dd><input type="password" name="token" autocomplete="off" pattern="[A-Za-z0-9]{32}" required></dd>
+  <dt>&nbsp;</dt>
+  <dd><input type="submit" value="Enroll"></dd>
+</dl>
+</form>
+<pre id="lookout-enroll-result" hidden></pre>
+
+<script>
+$(function () {
+  $('#lookout-enroll').on('submit', function (event) {
+    event.preventDefault();
+    var form = $(this);
+    var submit = form.find('input[type="submit"]');
+    var result = $('#lookout-enroll-result');
+    submit.prop('disabled', true);
+    result.prop('hidden', false).text('Enrolling...');
+    $.post(form.attr('action'), form.serialize(), null, 'json')
+      .done(function (data) {
+        result.text((data && data.output) || '');
+      })
+      .fail(function (xhr) {
+        var data = xhr.responseJSON || {};
+        result.text(data.output || data.error || ('enroll request failed (HTTP ' + xhr.status + ')'));
+      })
+      .always(function () {
+        form.find('input[name="token"]').val('');
+        submit.prop('disabled', false);
+      });
+  });
+});
+</script>

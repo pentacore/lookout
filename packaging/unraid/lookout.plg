@@ -1,0 +1,16 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name "lookout"> <!ENTITY author "pentacore"> <!ENTITY version "@PLG_VERSION@">
+<!ENTITY pluginURL "https://github.com/pentacore/lookout/releases/latest/download/lookout.plg">
+]>
+<PLUGIN name="&name;" author="&author;" version="&version;" pluginURL="&pluginURL;" min="6.12.0"
+        support="https://github.com/pentacore/lookout/issues" icon="eye">
+<CHANGES>### @PLG_VERSION@ - lookout @VERSION@</CHANGES>
+<FILE Name="/etc/rc.d/rc.lookout" Mode="0755"><INLINE><![CDATA[@RC_LOOKOUT@]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/lookout/scripts/supervise" Mode="0755"><INLINE><![CDATA[@SUPERVISE@]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/lookout/scripts/enroll" Mode="0755"><INLINE><![CDATA[@ENROLL@]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/lookout/Lookout.page"><INLINE><![CDATA[@PAGE@]]></INLINE></FILE>
+<FILE Name="/usr/local/emhttp/plugins/lookout/include/enroll.php"><INLINE><![CDATA[@ENROLL_PHP@]]></INLINE></FILE>
+<FILE Run="/bin/bash"><INLINE><![CDATA[@INSTALL@]]></INLINE></FILE>
+<FILE Run="/bin/bash" Method="remove"><INLINE><![CDATA[@REMOVE@]]></INLINE></FILE>
+</PLUGIN>

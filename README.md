@@ -29,6 +29,28 @@ If `minisign` is installed, the script checks the archive's signature against th
 
 ## Install on Unraid
 
+The plugin needs Unraid 6.12 or later.
+
+1. Go to **Plugins → Install Plugin**, paste `https://github.com/pentacore/lookout/releases/latest/download/lookout.plg` and click **Install**.
+2. Create an enrollment token on the platform.
+3. Go to **Settings → User Utilities → Lookout**, enter the platform URL and the token, and click **Enroll**.
+
+The page shows whether the agent runs, its version, the server UUID, the platform URL, and the time and error of the last report. Enrolling again from the page re-enrolls the server (`lookout enroll --force`) and restarts the agent. The enrollment token is passed to `lookout enroll` as a command-line argument, so it shows in the process list while enrolling. It is never written to the log or shown on the page.
+
+The plugin starts the agent at boot, not at array start, so it also runs while the array is stopped. A small supervisor restarts the agent 5 seconds after it exits. Use `/etc/rc.d/rc.lookout start|stop|restart|status` to control it by hand.
+
+| What | Where |
+| --- | --- |
+| Config | `/boot/config/plugins/lookout/lookout.yaml` |
+| Credentials and applied platform config | `/boot/config/plugins/lookout/state/` |
+| Binary (persistent copy) | `/boot/config/plugins/lookout/lookout`, copied to `/usr/local/bin/lookout` at install and at every boot, because `/boot` is not executable |
+| Status file | `/run/lookout/status.json` |
+| Logs | `/var/log/syslog`, tag `lookout` |
+
+The plugin downloads the agent from the GitHub release and checks it against `checksums.txt` (Unraid has no `minisign`), only when the persistent copy is missing or older than the plugin's release. Self-updates are verified with minisign by the agent and also update the persistent copy.
+
+Removing the plugin stops the agent and removes the binary, the rc script and the settings page. It keeps `/boot/config/plugins/lookout` (config, credentials and binary), so a reinstall keeps the server's identity. Delete that folder to forget the server.
+
 ## Configuration
 
 The agent reads a YAML file: `/etc/lookout/lookout.yaml` on Debian/Ubuntu and `/boot/config/plugins/lookout/lookout.yaml` on Unraid. All keys are optional except `platform_url`.
