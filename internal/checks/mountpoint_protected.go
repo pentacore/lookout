@@ -30,10 +30,33 @@ type mountpointProtectedParams struct {
 // every mount on top of parent removed, carries the immutable attribute.
 type inspectFunc func(ctx context.Context, env Env, parent collect.Mount, rel string) (immutable bool, err error)
 
-// cached is one successful inspection.
+// cached is one inspection whose answer holds until the TTL ends: a result,
+// or a filesystem that does not support file attributes.
 type cached struct {
 	immutable bool
+	err       error
 	at        time.Time
+}
+
+// cleanupError marks a failure to unmount or remove the inspection's temp
+// dir. It is reported even when the inspection itself also failed.
+type cleanupError struct{ err error }
+
+func (e cleanupError) Error() string { return "clean up: " + e.err.Error() }
+
+func (e cleanupError) Unwrap() error { return e.err }
+
+// hasCleanupError reports whether err carries a cleanupError.
+func hasCleanupError(err error) bool {
+	var cleanup cleanupError
+
+	return errors.As(err, &cleanup)
+}
+
+// isUnsupported reports whether err means the filesystem has no file
+// attributes, as opposed to a failed inspection.
+func isUnsupported(err error) bool {
+	return errors.Is(err, unix.ENOTTY) || errors.Is(err, unix.EOPNOTSUPP)
 }
 
 // mountpointProtected is the mountpoint_protected prevention lint: the
@@ -90,7 +113,7 @@ func (m *mountpointProtected) run(ctx context.Context, env Env, raw json.RawMess
 	immutable, err := m.immutable(ctx, env, path, parent, rel)
 
 	switch {
-	case errors.Is(err, unix.ENOTTY), errors.Is(err, unix.EOPNOTSUPP):
+	case err != nil && !hasCleanupError(err) && isUnsupported(err):
 		return Outcome{
 			Status:  wire.StatusError,
 			Message: fmt.Sprintf("filesystem at %s (%s) does not support file attributes", parent.MountPoint, parent.FSType),
@@ -116,9 +139,11 @@ func (m *mountpointProtected) run(ctx context.Context, env Env, raw json.RawMess
 	}
 }
 
-// immutable answers from the cache while it is fresh and otherwise inspects,
-// caching only successful inspections. The lock is not held across the
-// inspection, so one hung bind mount cannot block checks for other paths.
+// immutable answers from the cache while it is fresh and otherwise inspects.
+// Results and unsupported filesystems are cached; other errors, and any
+// inspection whose cleanup failed, are retried on the next run. The lock is
+// not held across the inspection, so one hung inspection cannot block checks
+// for other paths.
 func (m *mountpointProtected) immutable(ctx context.Context, env Env, path string, parent collect.Mount, rel string) (bool, error) {
 	now := env.Now()
 
@@ -127,19 +152,19 @@ func (m *mountpointProtected) immutable(ctx context.Context, env Env, path strin
 	m.mu.Unlock()
 
 	if ok && now.Sub(entry.at) < m.ttl {
-		return entry.immutable, nil
+		return entry.immutable, entry.err
 	}
 
 	immutable, err := m.inspect(ctx, env, parent, rel)
-	if err != nil {
+	if err != nil && (hasCleanupError(err) || !isUnsupported(err)) {
 		return false, err
 	}
 
 	m.mu.Lock()
-	m.cache[path] = cached{immutable: immutable, at: now}
+	m.cache[path] = cached{immutable: immutable, err: err, at: now}
 	m.mu.Unlock()
 
-	return immutable, nil
+	return immutable, err
 }
 
 // planUnderlying finds the mount that path is mounted on top of and path's

@@ -141,6 +141,20 @@ func TestMountpointProtectedStatuses(t *testing.T) {
 		},
 		{
 			checkCase: checkCase{
+				name:       "cleanup failure after unsupported",
+				params:     `{"path":"/mnt/backups"}`,
+				wantStatus: wire.StatusError,
+				wantMessage: "cannot inspect the directory under /mnt/backups: read attributes of /mnt/backups: " +
+					"inappropriate ioctl for device\nclean up: unmount /run/lookout/mp-1: device or resource busy",
+				wantObserved: map[string]any{"immutable": nil},
+			},
+			err: errors.Join(
+				fmt.Errorf("read attributes of /mnt/backups: %w", unix.ENOTTY),
+				cleanupError{err: errors.New("unmount /run/lookout/mp-1: device or resource busy")},
+			),
+		},
+		{
+			checkCase: checkCase{
 				name:         "not a mount point",
 				params:       `{"path":"/mnt/other"}`,
 				wantStatus:   wire.StatusError,
@@ -222,7 +236,14 @@ func TestMountpointProtectedCache(t *testing.T) {
 		{name: "cached within ttl", secondAt: 0, wantCalls: 1},
 		{name: "cached just before expiry", secondAt: 15*time.Minute - time.Second, wantCalls: 1},
 		{name: "expired after ttl", secondAt: 16 * time.Minute, wantCalls: 2},
-		{name: "errors are not cached", err: unix.ENOTTY, secondAt: 0, wantCalls: 2},
+		{name: "unsupported is cached", err: unix.ENOTTY, secondAt: 0, wantCalls: 1},
+		{name: "unsupported expires", err: fmt.Errorf("ioctl: %w", unix.EOPNOTSUPP), secondAt: 16 * time.Minute, wantCalls: 2},
+		{name: "other errors are not cached", err: errors.New("bind mount /: operation not permitted"), wantCalls: 2},
+		{
+			name:      "cleanup failures are not cached",
+			err:       errors.Join(unix.ENOTTY, cleanupError{err: errors.New("unmount: device or resource busy")}),
+			wantCalls: 2,
+		},
 	}
 
 	for _, tt := range tests {

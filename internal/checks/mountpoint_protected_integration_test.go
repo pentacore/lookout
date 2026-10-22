@@ -24,18 +24,45 @@ func TestIntegrationMountpointProtected(t *testing.T) {
 
 	tests := []struct {
 		name          string
-		immutable     bool
+		mount         func(t *testing.T) string
 		wantStatus    wire.CheckStatus
-		wantImmutable bool
+		wantImmutable any
+		wantContains  string
 	}{
-		{name: "immutable", immutable: true, wantStatus: wire.StatusOK, wantImmutable: true},
-		{name: "not immutable", immutable: false, wantStatus: wire.StatusWarn, wantImmutable: false},
+		{
+			name:          "immutable",
+			mount:         func(t *testing.T) string { return mountOverDir(t, true) },
+			wantStatus:    wire.StatusOK,
+			wantImmutable: true,
+		},
+		{
+			name:          "not immutable",
+			mount:         func(t *testing.T) string { return mountOverDir(t, false) },
+			wantStatus:    wire.StatusWarn,
+			wantImmutable: false,
+		},
+		{
+			name:          "underlying entry is a file",
+			mount:         mountOverFile,
+			wantStatus:    wire.StatusError,
+			wantImmutable: nil,
+			wantContains:  "not a directory",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := mountOverDir(t, tt.immutable)
-			runtimeDir := t.TempDir()
+			path := tt.mount(t)
+			runtimeDir, peerDir := sharedRuntimeDir(t)
+			namespaceBefore := mainMountNamespace(t)
+
+			hookCalls := 0
+			inspectMountedHook = func(dir string) {
+				hookCalls++
+				assertNotInHostNamespace(t)
+				assertReadOnlyInPrivateNamespace(t, dir)
+			}
+			t.Cleanup(func() { inspectMountedHook = nil })
 
 			env := Env{
 				Root:       "/",
@@ -56,7 +83,21 @@ func TestIntegrationMountpointProtected(t *testing.T) {
 					got.Status, got.Observed, got.Message, tt.wantStatus, tt.wantImmutable)
 			}
 
+			if !strings.Contains(got.Message, tt.wantContains) {
+				t.Errorf("message = %q, want it to contain %q", got.Message, tt.wantContains)
+			}
+
+			if hookCalls != 1 {
+				t.Errorf("inspect reached the mounted state %d times, want 1", hookCalls)
+			}
+
+			if after := mainMountNamespace(t); after != namespaceBefore {
+				t.Errorf("main thread mount namespace changed from %s to %s", namespaceBefore, after)
+			}
+
 			assertNoLeftovers(t, runtimeDir)
+			assertNoLeftovers(t, peerDir)
+			assertNotInHostNamespace(t)
 		})
 	}
 }
@@ -68,18 +109,8 @@ func TestIntegrationMountpointProtected(t *testing.T) {
 func mountOverDir(t *testing.T, immutable bool) string {
 	t.Helper()
 
-	parent := filepath.Join(t.TempDir(), "parent")
+	parent := mountTmpfs(t, filepath.Join(t.TempDir(), "parent"))
 	mp := filepath.Join(parent, "mp")
-
-	if err := os.Mkdir(parent, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := unix.Mount("tmpfs", parent, "tmpfs", 0, ""); err != nil {
-		t.Fatalf("mount tmpfs at %s: %v", parent, err)
-	}
-
-	t.Cleanup(func() { mustUnmount(t, parent) })
 
 	if err := os.Mkdir(mp, 0o755); err != nil {
 		t.Fatal(err)
@@ -101,13 +132,77 @@ func mountOverDir(t *testing.T, immutable bool) string {
 		})
 	}
 
-	if err := unix.Mount("tmpfs", mp, "tmpfs", 0, ""); err != nil {
-		t.Fatalf("mount tmpfs at %s: %v", mp, err)
+	return mountTmpfs(t, mp)
+}
+
+// mountOverFile mounts tmpfs at base/parent, creates the file base/parent/mp
+// and bind-mounts another file on top of it, so the underlying entry is not a
+// directory.
+func mountOverFile(t *testing.T) string {
+	t.Helper()
+
+	parent := mountTmpfs(t, filepath.Join(t.TempDir(), "parent"))
+	mp := filepath.Join(parent, "mp")
+	source := filepath.Join(t.TempDir(), "source")
+
+	for _, file := range []string{mp, source} {
+		if err := os.WriteFile(file, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := unix.Mount(source, mp, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("bind mount %s at %s: %v", source, mp, err)
 	}
 
 	t.Cleanup(func() { mustUnmount(t, mp) })
 
 	return mp
+}
+
+// sharedRuntimeDir returns a runtime dir on a shared tmpfs plus a peer bind
+// of it, so a mount made under the runtime dir in this namespace would show
+// up under the peer too.
+func sharedRuntimeDir(t *testing.T) (runtimeDir, peerDir string) {
+	t.Helper()
+
+	base := t.TempDir()
+	runtimeDir = mountTmpfs(t, filepath.Join(base, "run"))
+
+	if err := unix.Mount("", runtimeDir, "", unix.MS_SHARED, ""); err != nil {
+		t.Fatalf("make %s shared: %v", runtimeDir, err)
+	}
+
+	peerDir = filepath.Join(base, "peer")
+
+	if err := os.Mkdir(peerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := unix.Mount(runtimeDir, peerDir, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("bind %s at %s: %v", runtimeDir, peerDir, err)
+	}
+
+	t.Cleanup(func() { mustUnmount(t, peerDir) })
+
+	return runtimeDir, peerDir
+}
+
+// mountTmpfs creates path, mounts a tmpfs there and unmounts it on cleanup.
+func mountTmpfs(t *testing.T, path string) string {
+	t.Helper()
+
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := unix.Mount("tmpfs", path, "tmpfs", 0, ""); err != nil {
+		t.Fatalf("mount tmpfs at %s: %v", path, err)
+	}
+
+	t.Cleanup(func() { mustUnmount(t, path) })
+
+	return path
 }
 
 func setImmutable(path string, on bool) error {
@@ -140,28 +235,80 @@ func mustUnmount(t *testing.T, path string) {
 	}
 }
 
-// assertNoLeftovers fails when the check left a temp dir in runtimeDir or a
-// mount anywhere under it.
-func assertNoLeftovers(t *testing.T, runtimeDir string) {
+// mainMountNamespace identifies the mount namespace /proc/self resolves
+// through, i.e. the main thread's.
+func mainMountNamespace(t *testing.T) string {
 	t.Helper()
 
-	entries, err := os.ReadDir(runtimeDir)
+	namespace, err := os.Readlink("/proc/self/ns/mnt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return namespace
+}
+
+// assertNotInHostNamespace fails when the main thread's namespace shows an
+// inspection mount anywhere, including under a peer of the runtime dir.
+func assertNotInHostNamespace(t *testing.T) {
+	t.Helper()
+
+	for _, line := range mountInfoLines(t, "/proc/self/mountinfo") {
+		if strings.Contains(line, "/mp-") {
+			t.Errorf("inspection mount visible in the host namespace: %s", line)
+		}
+	}
+}
+
+// assertReadOnlyInPrivateNamespace fails unless the calling thread's
+// namespace has dir mounted read-only.
+func assertReadOnlyInPrivateNamespace(t *testing.T, dir string) {
+	t.Helper()
+
+	for _, line := range mountInfoLines(t, "/proc/thread-self/mountinfo") {
+		fields := strings.Fields(line)
+		if len(fields) > 5 && collect.Unescape(fields[4]) == dir {
+			if !strings.HasPrefix(fields[5], "ro") {
+				t.Errorf("inspection mount is not read-only: %s", line)
+			}
+
+			return
+		}
+	}
+
+	t.Errorf("inspection mount %s not found in the private namespace", dir)
+}
+
+func mountInfoLines(t *testing.T, path string) []string {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Error(err)
+
+		return nil
+	}
+
+	return strings.Split(strings.TrimSpace(string(data)), "\n")
+}
+
+// assertNoLeftovers fails when dir holds a leftover temp dir or the host
+// namespace has a mount anywhere under dir.
+func assertNoLeftovers(t *testing.T, dir string) {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if len(entries) != 0 {
-		t.Errorf("runtime dir has %d leftover entries, want none", len(entries))
+		t.Errorf("%s has %d leftover entries, want none", dir, len(entries))
 	}
 
-	mountinfo, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for line := range strings.Lines(string(mountinfo)) {
-		if strings.Contains(line, runtimeDir) {
-			t.Errorf("mount left behind: %s", strings.TrimSpace(line))
+	for _, line := range mountInfoLines(t, "/proc/self/mountinfo") {
+		if fields := strings.Fields(line); len(fields) > 4 && strings.HasPrefix(collect.Unescape(fields[4]), dir+"/") {
+			t.Errorf("mount left behind under %s: %s", dir, line)
 		}
 	}
 }
