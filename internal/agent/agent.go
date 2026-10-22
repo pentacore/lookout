@@ -124,16 +124,21 @@ func (a *Agent) Run(ctx context.Context) error {
 		if a.d.Sleep(ctx, a.d.Backoff.Next(err, a.interval)) != nil {
 			return nil
 		}
-		if isStatus(err, http.StatusUnauthorized) && !a.waitForCredentials(ctx) {
-			return nil
+		if isStatus(err, http.StatusUnauthorized) {
+			// Re-enrolling (enroll --force) also resets the saved config, so
+			// the new identity must not keep reporting the old one's checks.
+			if !a.waitForCredentials(ctx) {
+				return nil
+			}
+			a.loadPlatformConfig()
 		}
 	}
 	return nil
 }
 
 // waitForCredentials loads the credentials, retrying every 15 s. Each kind of
-// failure (not enrolled, unreadable) is logged once per wait. It returns false
-// when ctx is cancelled first.
+// failure (not enrolled, unreadable) is logged and written to the status file
+// once per wait. It returns false when ctx is cancelled first.
 func (a *Agent) waitForCredentials(ctx context.Context) bool {
 	var loggedMissing, loggedBroken bool
 	for {
@@ -143,13 +148,18 @@ func (a *Agent) waitForCredentials(ctx context.Context) bool {
 			a.status.ServerUUID = creds.ServerUUID
 			return true
 		}
-		switch missing := errors.Is(err, fs.ErrNotExist); {
+		missing := errors.Is(err, fs.ErrNotExist)
+		switch {
 		case missing && !loggedMissing:
 			loggedMissing = true
 			a.log.Warn(notEnrolledMsg)
+			a.status.LastError = notEnrolledMsg
+			a.writeStatus()
 		case !missing && !loggedBroken:
 			loggedBroken = true
 			a.log.Error("cannot load credentials; retrying every 15s", "error", err)
+			a.status.LastError = "cannot load credentials: " + err.Error()
+			a.writeStatus()
 		}
 		if a.d.Sleep(ctx, credentialsRetry) != nil {
 			return false
@@ -235,19 +245,23 @@ func (a *Agent) recordOutcome(at string, err error) {
 
 	a.failures++
 	token := a.creds.AgentToken
-	a.status.LastError = platform.Redact(err.Error(), token)
+	redacted := platform.Redact(err.Error(), token)
+	a.status.LastError = redacted
+	if isStatus(err, http.StatusUnauthorized) {
+		a.status.LastError = rejectedMsg
+	}
 	a.writeStatus()
 
 	var se *platform.StatusError
 	switch {
 	case !errors.As(err, &se):
-		a.log.Warn("report failed", "attempt", a.failures, "error", a.status.LastError)
+		a.log.Warn("report failed", "attempt", a.failures, "error", redacted)
 	case se.Code == http.StatusUnauthorized:
 		a.log.Error(rejectedMsg)
 	case se.Code == http.StatusUnprocessableEntity:
 		a.log.Warn("platform rejected the report", "status", se.Code, "body", platform.Redact(se.Body, token))
 	default:
-		a.log.Warn("report failed", "status", se.Code, "attempt", a.failures, "error", a.status.LastError)
+		a.log.Warn("report failed", "status", se.Code, "attempt", a.failures, "error", redacted)
 	}
 }
 

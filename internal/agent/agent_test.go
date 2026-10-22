@@ -205,15 +205,18 @@ func (h *harness) runWith(ctx context.Context, cancel context.CancelFunc) {
 	}
 }
 
+// readStatus returns the status file. It reports failures with Errorf, not
+// Fatalf, because onSleep hooks call it from the Run goroutine.
 func (h *harness) readStatus() status {
 	h.t.Helper()
+	var s status
 	data, err := os.ReadFile(filepath.Join(h.runtimeDir, "status.json"))
 	if err != nil {
-		h.t.Fatalf("read status.json: %v", err)
+		h.t.Errorf("read status.json: %v", err)
+		return s
 	}
-	var s status
 	if err := json.Unmarshal(data, &s); err != nil {
-		h.t.Fatalf("parse status.json %q: %v", data, err)
+		h.t.Errorf("parse status.json %q: %v", data, err)
 	}
 	return s
 }
@@ -224,19 +227,30 @@ func statusErr(code int, body string) error {
 
 func TestAgentWaitsForEnrollment(t *testing.T) {
 	tests := []struct {
-		name    string
-		err     error
-		wantLog string
-		level   string
+		name       string
+		err        error
+		wantLog    string
+		level      string
+		wantStatus string
 	}{
-		{"not enrolled", fmt.Errorf("open credentials.json: %w", fs.ErrNotExist), "not enrolled yet; run: lookout enroll --url … --token …", "level=WARN"},
-		{"corrupt credentials", errors.New("parse credentials.json: unexpected end of JSON input"), "cannot load credentials", "level=ERROR"},
+		{"not enrolled", fmt.Errorf("open credentials.json: %w", fs.ErrNotExist), "not enrolled yet; run: lookout enroll --url … --token …", "level=WARN", "not enrolled"},
+		{"corrupt credentials", errors.New("parse credentials.json: unexpected end of JSON input"), "cannot load credentials", "level=ERROR", "cannot load credentials"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness(t, 3)
 			h.credSteps = []credStep{{err: tt.err}, {err: tt.err}}
+			var waiting status
+			h.onSleep = func(n int) {
+				if n == 1 {
+					waiting = h.readStatus()
+				}
+			}
 			h.run()
+
+			if !strings.Contains(waiting.LastError, tt.wantStatus) || waiting.AgentVersion != "dev" {
+				t.Errorf("status while waiting = %+v, want last_error mentioning %q", waiting, tt.wantStatus)
+			}
 
 			if want := []time.Duration{15 * time.Second, 15 * time.Second, time.Minute}; !reflect.DeepEqual(h.sleeps, want) {
 				t.Errorf("sleeps = %v, want %v", h.sleeps, want)
@@ -444,12 +458,21 @@ func TestAgentCorruptPlatformConfigUsesDefaults(t *testing.T) {
 func TestAgent401(t *testing.T) {
 	h := newHarness(t, 2)
 	h.reports = []reportStep{{err: statusErr(401, `{"message":"Unauthenticated."}`)}}
+	var rejected status
+	h.onSleep = func(n int) {
+		if n == 1 {
+			rejected = h.readStatus()
+		}
+	}
 	h.run()
 
 	if h.sleeps[0] != 15*time.Minute {
 		t.Errorf("sleep after 401 = %v, want 15m", h.sleeps[0])
 	}
-	want := []string{"load-credentials", "load-config", "report", "sleep 15m0s", "load-credentials", "report", "sleep 1m0s"}
+	if !strings.Contains(rejected.LastError, "re-enroll") {
+		t.Errorf("status after 401 = %+v, want last_error telling to re-enroll", rejected)
+	}
+	want := []string{"load-credentials", "load-config", "report", "sleep 15m0s", "load-credentials", "load-config", "report", "sleep 1m0s"}
 	if !reflect.DeepEqual(h.events, want) {
 		t.Errorf("events = %v, want %v", h.events, want)
 	}
@@ -461,12 +484,20 @@ func TestAgent401(t *testing.T) {
 
 func TestAgent401PicksUpNewCredentials(t *testing.T) {
 	h := newHarness(t, 4)
+	h.cfg = state.PlatformConfig{ConfigVersion: 3, ReportIntervalSeconds: 60, Checks: []wire.CheckConfig{check1}}
 	h.reports = []reportStep{{err: statusErr(401, "")}}
 	newCreds := state.Credentials{ServerUUID: "new", AgentToken: "new.token"}
 	h.credSteps = []credStep{
 		{creds: testCreds},
 		{err: fs.ErrNotExist},
 		{creds: newCreds},
+	}
+	// lookout enroll --force resets the saved config while the agent sleeps.
+	check2 := wire.CheckConfig{ID: "c2", Type: "path_on_mount", Params: json.RawMessage(`{"path":"/a","mount":"/"}`)}
+	h.onSleep = func(n int) {
+		if n == 1 {
+			h.cfg = state.PlatformConfig{ConfigVersion: 0, ReportIntervalSeconds: 60, Checks: []wire.CheckConfig{check2}}
+		}
 	}
 	h.run()
 
@@ -476,6 +507,15 @@ func TestAgent401PicksUpNewCredentials(t *testing.T) {
 	}
 	if !reflect.DeepEqual(h.tokens, []string{testToken, "new.token", "new.token"}) {
 		t.Errorf("tokens = %v, want the new token after re-enrolling", h.tokens)
+	}
+	if got := h.requests[0].ConfigVersion; got != 3 {
+		t.Errorf("first config_version = %d, want 3", got)
+	}
+	if got := h.requests[1].ConfigVersion; got != 0 {
+		t.Errorf("config_version after re-enrolling = %d, want the reloaded 0", got)
+	}
+	if !reflect.DeepEqual(h.runnerCfgs[1], []wire.CheckConfig{check2}) {
+		t.Errorf("runner got %+v after re-enrolling, want the reloaded [c2]", h.runnerCfgs[1])
 	}
 }
 
@@ -598,6 +638,9 @@ func TestAgentStatusWriteFailureKeepsReporting(t *testing.T) {
 		t.Errorf("reports = %d, want 2", len(h.requests))
 	}
 	logs := h.log.String()
+	if !strings.Contains(logs, `level=WARN msg="cannot create runtime directory"`) {
+		t.Errorf("log lacks the runtime directory warning:\n%s", logs)
+	}
 	if !strings.Contains(logs, "level=DEBUG") || strings.Contains(logs, "level=ERROR") {
 		t.Errorf("status write failure should log at debug only:\n%s", logs)
 	}
