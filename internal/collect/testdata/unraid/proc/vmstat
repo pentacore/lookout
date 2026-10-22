@@ -1,0 +1,5 @@
+nr_free_pages 512000
+nr_zone_inactive_anon 1000
+pgfault 123456
+oom_kill 3
+pgmajfault 42
