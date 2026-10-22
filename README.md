@@ -4,6 +4,29 @@ lookout is a small host monitoring agent. It runs on a Debian/Ubuntu server or a
 
 ## Install on Debian/Ubuntu
 
+The install script supports `amd64` and `arm64` systems that run systemd. Create an enrollment token on the platform, then run:
+
+```sh
+curl -fsSLO https://github.com/pentacore/lookout/releases/latest/download/install.sh
+sudo sh install.sh --url https://media.pentacore.se --token <TOKEN>
+```
+
+The script downloads the release archive, verifies it, installs `/usr/local/bin/lookout`, writes `/etc/lookout/lookout.yaml`, enrolls the server, and enables and starts the `lookout` systemd service. Options:
+
+| Flag | Meaning |
+| --- | --- |
+| `--url` | Platform base URL. Required on first install. |
+| `--token` | Enrollment token. Required until the server is enrolled. |
+| `--version` | Release to install, such as `0.2.0` or `latest`. Defaults to the version the script was released with. |
+
+Running the script again is safe. It upgrades the binary, keeps `/etc/lookout/lookout.yaml` and restarts the service. With no `--url` it reuses the `platform_url` from the config, and a different `--url` replaces only that line. Passing `--token` on an enrolled server re-enrolls it.
+
+The enrollment token is passed as a command-line argument, so it is visible in the process list while the script runs. This is accepted for now because the token is single-use, expires after 24 hours and the host is root-only. The script never prints it.
+
+### How the download is verified
+
+If `minisign` is installed, the script checks the archive's signature against the public key built into the script. Otherwise it checks the archive against `checksums.txt` and prints a warning. Both checks trust the same GitHub release that served the script. A minisign check only adds authenticity when you obtained the public key out of band, for example by comparing it with the key published in the repository. Every later self-update is verified with minisign by the agent itself.
+
 ## Install on Unraid
 
 ## Configuration
