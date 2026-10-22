@@ -312,3 +312,71 @@ func assertNoLeftovers(t *testing.T, dir string) {
 		}
 	}
 }
+
+// TestIntegrationMountpointProtectedHungInspection hangs the real inspection
+// inside its namespace past the runner's budget: the check ID must stay in
+// flight, so the next cycle reports it instead of starting another locked
+// thread with its own namespace and bind mount.
+func TestIntegrationMountpointProtectedHungInspection(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to mount tmpfs and bind mounts")
+	}
+
+	path := mountOverDir(t, false)
+	runtimeDir, _ := sharedRuntimeDir(t)
+
+	release := make(chan struct{})
+	hookCalls := make(chan struct{}, 10)
+	inspectMountedHook = func(string) {
+		hookCalls <- struct{}{}
+		<-release
+	}
+	t.Cleanup(func() { inspectMountedHook = nil })
+
+	runner := &Runner{
+		Registry: Registry{"mountpoint_protected": newMountpointProtected(inspectUnderlying).Run},
+		Env: Env{
+			Root:       "/",
+			RuntimeDir: runtimeDir,
+			Mounts:     func() (collect.MountTable, error) { return collect.ReadMountTable("/") },
+			Now:        time.Now,
+		},
+		Budget: 100 * time.Millisecond,
+	}
+
+	params, err := json.Marshal(map[string]string{"path": path})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfgs := []wire.CheckConfig{{ID: "mp", Type: "mountpoint_protected", Params: params}}
+
+	first := runner.Run(context.Background(), cfgs)
+
+	// Give an early-returning check time to release its in-flight slot.
+	time.Sleep(100 * time.Millisecond)
+
+	second := runner.Run(context.Background(), cfgs)
+
+	if !strings.HasPrefix(first[0].Message, "timed out") {
+		t.Errorf("first run = %q, want a timeout", first[0].Message)
+	}
+
+	if !strings.Contains(second[0].Message, "previous run still in progress") {
+		t.Errorf("second run = %q, want the previous run still in progress", second[0].Message)
+	}
+
+	close(release)
+
+	if got := len(hookCalls); got != 1 {
+		t.Errorf("inspections started = %d, want 1", got)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for runner.Run(context.Background(), cfgs)[0].Status == wire.StatusError && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	assertNoLeftovers(t, runtimeDir)
+	assertNotInHostNamespace(t)
+}

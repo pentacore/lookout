@@ -2,8 +2,10 @@ package checks
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,10 +147,10 @@ func TestMountpointProtectedStatuses(t *testing.T) {
 				params:     `{"path":"/mnt/backups"}`,
 				wantStatus: wire.StatusError,
 				wantMessage: "cannot inspect the directory under /mnt/backups: read attributes of /mnt/backups: " +
-					"inappropriate ioctl for device\nclean up: unmount /run/lookout/mp-1: device or resource busy",
+					"inappropriate ioctl for device; clean up: unmount /run/lookout/mp-1: device or resource busy",
 				wantObserved: map[string]any{"immutable": nil},
 			},
-			err: errors.Join(
+			err: fmt.Errorf("%w; %w",
 				fmt.Errorf("read attributes of /mnt/backups: %w", unix.ENOTTY),
 				cleanupError{err: errors.New("unmount /run/lookout/mp-1: device or resource busy")},
 			),
@@ -241,7 +243,7 @@ func TestMountpointProtectedCache(t *testing.T) {
 		{name: "other errors are not cached", err: errors.New("bind mount /: operation not permitted"), wantCalls: 2},
 		{
 			name:      "cleanup failures are not cached",
-			err:       errors.Join(unix.ENOTTY, cleanupError{err: errors.New("unmount: device or resource busy")}),
+			err:       fmt.Errorf("%w; %w", unix.ENOTTY, cleanupError{err: errors.New("unmount: device or resource busy")}),
 			wantCalls: 2,
 		},
 	}
@@ -285,5 +287,46 @@ func TestMountpointProtectedCacheIsPerPath(t *testing.T) {
 func TestDefaultRegistryHasMountpointProtected(t *testing.T) {
 	if DefaultRegistry()["mountpoint_protected"] == nil {
 		t.Error(`DefaultRegistry has no "mountpoint_protected"`)
+	}
+}
+
+// TestMountpointProtectedHungInspectionStaysInFlight runs the check under a
+// Runner whose budget expires while inspect hangs: the next run must report
+// the check as still in progress rather than start a second inspection.
+func TestMountpointProtectedHungInspectionStaysInFlight(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 10)
+	hung := func(context.Context, Env, collect.Mount, string) (bool, error) {
+		started <- struct{}{}
+		<-release
+
+		return true, nil
+	}
+
+	runner := &Runner{
+		Registry: Registry{"mountpoint_protected": newMountpointProtected(hung).Run},
+		Env:      newTestEnv(t, testMountInfo),
+		Budget:   20 * time.Millisecond,
+	}
+	cfgs := []wire.CheckConfig{{ID: "mp", Type: "mountpoint_protected", Params: json.RawMessage(`{"path":"/mnt/backups"}`)}}
+
+	first := runner.Run(context.Background(), cfgs)
+
+	time.Sleep(50 * time.Millisecond)
+
+	second := runner.Run(context.Background(), cfgs)
+
+	close(release)
+
+	if !strings.HasPrefix(first[0].Message, "timed out") {
+		t.Errorf("first run = %q, want a timeout", first[0].Message)
+	}
+
+	if !strings.Contains(second[0].Message, "previous run still in progress") {
+		t.Errorf("second run = %q, want the previous run still in progress", second[0].Message)
+	}
+
+	if got := len(started); got != 1 {
+		t.Errorf("inspections started = %d, want 1", got)
 	}
 }

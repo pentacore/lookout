@@ -28,8 +28,10 @@ type inspectResult struct {
 // inspectUnderlying reads FS_IMMUTABLE_FL from the directory underneath a
 // mount point. The work happens on a dedicated OS thread in its own private
 // mount namespace (see inspectInPrivateNamespace), so the temp bind mount is
-// never visible to, or propagated into, any other namespace. If ctx ends
-// first, it returns and the inspection finishes on its own.
+// never visible to, or propagated into, any other namespace. ctx is checked
+// only before starting: the call then blocks until the inspection finishes,
+// even when it hangs on a hung parent filesystem, so the runner keeps the
+// check in flight instead of starting another locked thread every cycle.
 func inspectUnderlying(ctx context.Context, env Env, parent collect.Mount, rel string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -39,12 +41,20 @@ func inspectUnderlying(ctx context.Context, env Env, parent collect.Mount, rel s
 
 	go func() { results <- inspectOnPrivateThread(env, parent, rel) }()
 
-	select {
-	case result := <-results:
-		return result.immutable, result.err
-	case <-ctx.Done():
-		return false, ctx.Err()
+	result := <-results
+
+	return result.immutable, result.err
+}
+
+// withCleanup adds a failed unmount or rmdir to err, joined with "; " so the
+// outcome message stays on one line.
+func withCleanup(err, cleanupErr error) error {
+	cleanup := cleanupError{err: cleanupErr}
+	if err == nil {
+		return cleanup
 	}
+
+	return fmt.Errorf("%w; %w", err, cleanup)
 }
 
 // inspectOnPrivateThread locks the calling goroutine to its OS thread and
@@ -77,7 +87,7 @@ func inspectOnPrivateThread(env Env, parent collect.Mount, rel string) inspectRe
 // env.RuntimeDir (tmpfs, never the Unraid flash state dir), so mounts on top
 // of parent are not carried and rel shows the directory underneath them. The
 // bind is remounted read-only before the directory is opened. Unmount and
-// rmdir still run for tidiness; their failures are joined to err as
+// rmdir still run for tidiness; their failures are added to err as
 // cleanupError.
 func inspectInPrivateNamespace(env Env, parent collect.Mount, rel string) (immutable bool, err error) {
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
@@ -99,7 +109,7 @@ func inspectInPrivateNamespace(env Env, parent collect.Mount, rel string) (immut
 
 	defer func() {
 		if removeErr := os.Remove(dir); removeErr != nil {
-			err = errors.Join(err, cleanupError{err: removeErr})
+			err = withCleanup(err, removeErr)
 		}
 	}()
 
@@ -117,7 +127,7 @@ func inspectInPrivateNamespace(env Env, parent collect.Mount, rel string) (immut
 		}
 
 		if unmountErr != nil {
-			err = errors.Join(err, cleanupError{err: fmt.Errorf("unmount %s: %w", dir, unmountErr)})
+			err = withCleanup(err, fmt.Errorf("unmount %s: %w", dir, unmountErr))
 		}
 	}()
 
