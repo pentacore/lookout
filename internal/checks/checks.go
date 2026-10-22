@@ -65,10 +65,11 @@ type Registry map[string]Func
 // DefaultRegistry returns the check types this agent supports.
 func DefaultRegistry() Registry {
 	return Registry{
-		"mount_present":  mountPresent,
-		"path_on_mount":  pathOnMount,
-		"file_freshness": fileFreshness,
-		"db_ping":        dbPing,
+		"mount_present":        mountPresent,
+		"path_on_mount":        pathOnMount,
+		"file_freshness":       fileFreshness,
+		"db_ping":              dbPing,
+		"mountpoint_protected": sharedMountpointProtected.Run,
 	}
 }
 
