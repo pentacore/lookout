@@ -108,7 +108,7 @@ type FilesystemCollector struct {
 	Logger  *slog.Logger
 
 	mu       sync.Mutex
-	inFlight map[string]bool
+	inFlight map[string]bool // keyed by mountInstanceKey
 }
 
 type statfsOutcome struct {
@@ -120,11 +120,12 @@ type statfsOutcome struct {
 // concurrently under {Root}/{MountPoint}. A mount whose statfs times out,
 // fails, or is still stuck from an earlier call is reported unresponsive with
 // no byte fields; no entry is ever dropped. The result is never nil.
+// Collect must not be called concurrently.
 func (c *FilesystemCollector) Collect(t MountTable) []wire.Filesystem {
 	mounts := SelectFilesystems(t)
 	outcomes := make([]chan statfsOutcome, len(mounts))
 	for i, m := range mounts {
-		outcomes[i] = c.start(m.MountPoint)
+		outcomes[i] = c.start(m)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout())
@@ -172,40 +173,49 @@ func awaitStatfs(ctx context.Context, outcome <-chan statfsOutcome) (statfsOutco
 	}
 }
 
-// start launches statfs for mountPoint in the background and marks it in
-// flight until it returns. It returns nil, without calling statfs, when an
-// earlier call for mountPoint is still in flight.
-func (c *FilesystemCollector) start(mountPoint string) chan statfsOutcome {
+// start launches statfs for m in the background and marks the mount instance
+// in flight until it returns. It returns nil, without calling statfs, when an
+// earlier call for the same instance is still in flight.
+func (c *FilesystemCollector) start(m Mount) chan statfsOutcome {
+	key := mountInstanceKey(m)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.inFlight[mountPoint] {
+	if c.inFlight[key] {
 		return nil
 	}
 	if c.inFlight == nil {
 		c.inFlight = map[string]bool{}
 	}
-	c.inFlight[mountPoint] = true
+	c.inFlight[key] = true
 
 	statfs := c.Statfs
 	if statfs == nil {
 		statfs = RealStatfs
 	}
-	path := filepath.Join(c.Root, mountPoint)
+	path := filepath.Join(c.Root, m.MountPoint)
 	outcome := make(chan statfsOutcome, 1)
 	go func() {
 		result, err := statfs(path)
 		c.mu.Lock()
-		delete(c.inFlight, mountPoint)
+		delete(c.inFlight, key)
 		c.mu.Unlock()
 		outcome <- statfsOutcome{result: result, err: err}
 	}()
 	return outcome
 }
 
-func (c *FilesystemCollector) isInFlight(mountPoint string) bool {
+// mountInstanceKey identifies one mount, not just its path: after a lazy
+// unmount and remount at the same path, the stuck statfs still pins the old
+// mount ID, so the new instance gets a fresh key and is polled. At most one
+// stuck goroutine exists per mount instance.
+func mountInstanceKey(m Mount) string {
+	return fmt.Sprintf("%d %s", m.ID, m.MountPoint)
+}
+
+func (c *FilesystemCollector) isInFlight(m Mount) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.inFlight[mountPoint]
+	return c.inFlight[mountInstanceKey(m)]
 }
 
 func (c *FilesystemCollector) timeout() time.Duration {

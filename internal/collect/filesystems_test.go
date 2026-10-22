@@ -168,10 +168,10 @@ func TestFilesystemCollectorStatfsError(t *testing.T) {
 }
 
 func TestFilesystemCollectorHungStatfs(t *testing.T) {
-	release := make(chan struct{})
+	release := newReleaseChannel(t)
 	fake := &fakeStatfs{
 		sizes:  StatfsResult{Total: 1000, Free: 400, Available: 300},
-		blocks: map[string]chan struct{}{"/mnt/backups": release},
+		blocks: map[string]chan struct{}{"/mnt/backups": release.ch},
 	}
 	collector, logs := newTestFilesystemCollector(fake.statfs, 50*time.Millisecond)
 	table := readUnraidMounts(t)
@@ -200,23 +200,73 @@ func TestFilesystemCollectorHungStatfs(t *testing.T) {
 		t.Errorf("statfs calls for /mnt/backups = %d, want 1 while in flight", got)
 	}
 
-	close(release)
-	waitNotInFlight(t, collector, "/mnt/backups")
+	release.release()
+	waitNotInFlight(t, collector, mountByID(t, table, 33))
 
 	third := collector.Collect(table)
 	assertSizes(t, findFilesystem(t, third, "/mnt/backups"), 1000, 600, 300)
 }
 
+// releaseChannel unblocks a fake statfs once, either from the test or at
+// cleanup, so a failing assertion can't leak the blocked goroutine.
+type releaseChannel struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func newReleaseChannel(t *testing.T) *releaseChannel {
+	t.Helper()
+	r := &releaseChannel{ch: make(chan struct{})}
+	t.Cleanup(r.release)
+	return r
+}
+
+func (r *releaseChannel) release() {
+	r.once.Do(func() { close(r.ch) })
+}
+
 // waitNotInFlight waits until the collector's background statfs for mount has
 // returned.
-func waitNotInFlight(t *testing.T, c *FilesystemCollector, mount string) {
+func waitNotInFlight(t *testing.T, c *FilesystemCollector, mount Mount) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for c.isInFlight(mount) {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s still in flight after 2s", mount)
+			t.Fatalf("%s (ID %d) still in flight after 2s", mount.MountPoint, mount.ID)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestFilesystemCollectorRemountWhileHung(t *testing.T) {
+	// A dead hard NFS mount is lazily unmounted and mounted again at the same
+	// path: the stuck statfs pins the old instance, the new one must be polled.
+	release := newReleaseChannel(t)
+	var mu sync.Mutex
+	calls := 0
+	statfs := func(path string) (StatfsResult, error) {
+		mu.Lock()
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first {
+			<-release.ch
+		}
+		return StatfsResult{Total: 1000, Free: 400, Available: 300}, nil
+	}
+	collector, _ := newTestFilesystemCollector(statfs, 50*time.Millisecond)
+
+	hung := parseTable(t, "33 1 0:41 / /mnt/backups rw - nfs4 nas:/backups rw\n")
+	assertUnresponsiveBackups(t, collector.Collect(hung))
+
+	remounted := parseTable(t, "99 1 0:52 / /mnt/backups rw - nfs4 nas:/backups rw\n")
+	got := collector.Collect(remounted)
+	assertSizes(t, findFilesystem(t, got, "/mnt/backups"), 1000, 600, 300)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Errorf("statfs calls = %d, want 2 (one per mount instance)", calls)
 	}
 }
 
