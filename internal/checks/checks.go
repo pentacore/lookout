@@ -64,7 +64,11 @@ type Registry map[string]Func
 
 // DefaultRegistry returns the check types this agent supports.
 func DefaultRegistry() Registry {
-	return Registry{}
+	return Registry{
+		"mount_present":  mountPresent,
+		"path_on_mount":  pathOnMount,
+		"file_freshness": fileFreshness,
+	}
 }
 
 // decodeParams decodes check params into T. Empty or null params mean {} and
