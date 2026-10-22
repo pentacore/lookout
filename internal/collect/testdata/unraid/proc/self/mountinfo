@@ -1,0 +1,16 @@
+1 0 0:2 / / rw,relatime shared:1 - rootfs rootfs rw,size=16G
+22 1 0:20 / /proc rw,relatime shared:2 - proc proc rw
+23 1 0:21 / /sys rw,relatime - sysfs sysfs rw
+24 1 0:5 / /dev rw - devtmpfs devtmpfs rw,size=8G
+25 1 0:22 / /run rw,nosuid - tmpfs tmpfs rw
+26 23 0:23 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw
+30 1 8:1 / /boot rw,noatime - vfat /dev/sda1 rw
+31 1 9:1 / /mnt/disk1 rw,noatime - xfs /dev/md1p1 rw
+32 1 0:40 / /mnt/user rw - fuse.shfs shfs rw,user_id=0
+33 1 0:41 / /mnt/backups rw shared:9 master:3 - nfs4 nas:/backups rw,vers=4.2
+34 1 9:1 /appdata /mnt/appdata\040cache rw - xfs /dev/md1p1 rw
+35 1 9:1 / /mnt/disk1-bind rw - xfs /dev/md1p1 rw
+40 1 7:0 / /var/lib/docker rw - btrfs /dev/loop0 rw
+41 40 7:0 /btrfs/subvolumes/abc /var/lib/docker/btrfs/subvolumes/abc rw - btrfs /dev/loop0 rw
+42 40 0:51 / /var/lib/docker/overlay2/abc/merged rw - overlay overlay rw,lowerdir=/x
+43 25 0:4 net:[4026532] /run/docker/netns/abc rw - nsfs nsfs rw
