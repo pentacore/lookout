@@ -1,0 +1,5 @@
+dist/
+build/
+docs/superpowers/
+*.test
+coverage.out
