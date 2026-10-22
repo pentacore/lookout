@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "agent_version": "0.1.0",
+  "sent_at": "2026-10-22T12:00:00Z",
+  "config_version": 3,
+  "host": {
+    "hostname": "babel",
+    "os": "unraid 7.1.4",
+    "kernel": "6.12.24-Unraid",
+    "arch": "amd64",
+    "uptime_seconds": 86400
+  },
+  "metrics": {
+    "cpu_percent": 12.5,
+    "load": [
+      0.5,
+      0.7,
+      0.9
+    ],
+    "memory": {
+      "total_bytes": 16000000000,
+      "available_bytes": 8000000000,
+      "swap_total_bytes": 2000000000,
+      "swap_free_bytes": 1500000000
+    },
+    "oom_kills_total": 0,
+    "filesystems": [
+      {
+        "mount": "/",
+        "device": "rootfs",
+        "fstype": "rootfs",
+        "total_bytes": 1000000,
+        "used_bytes": 400000,
+        "available_bytes": 600000,
+        "unresponsive": false
+      },
+      {
+        "mount": "/mnt/backups",
+        "device": "nas:/backups",
+        "fstype": "nfs4",
+        "unresponsive": true
+      }
+    ],
+    "failed_units": null,
+    "containers": [
+      {
+        "name": "postfix-mailcow",
+        "state": "running",
+        "health": "healthy",
+        "restart_count": 4
+      }
+    ]
+  },
+  "checks": [
+    {
+      "id": "c1",
+      "type": "mount_present",
+      "status": "crit",
+      "message": "/mnt/backups is not mounted",
+      "observed": {
+        "mounted": false
+      }
+    }
+  ]
+}
