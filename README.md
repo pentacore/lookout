@@ -4,24 +4,35 @@ lookout is a small host monitoring agent. It runs on a Debian/Ubuntu server or a
 
 ## Install on Debian/Ubuntu
 
-The install script supports `amd64` and `arm64` systems that run systemd. Create an enrollment token on the platform, then run:
+The install script supports `amd64` and `arm64` systems that run systemd. Create an enrollment token on the platform, then run the script as root with the token in the `LOOKOUT_TOKEN` environment variable:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSLO https://github.com/pentacore/lookout/releases/latest/download/install.sh
-sudo sh install.sh --url https://media.pentacore.se --token <TOKEN>
+sudo -s                       # a root shell; the commands below are not logged by sudo
+read -rs LOOKOUT_TOKEN        # paste the token and press Enter; nothing is shown
+export LOOKOUT_TOKEN
+sh install.sh --url https://media.pentacore.se
+unset LOOKOUT_TOKEN
+exit
 ```
+
+`sh install.sh --url … --token <TOKEN>` also works, but avoid it with `sudo`: see [The enrollment token](#the-enrollment-token).
 
 The script downloads the release archive, verifies it, installs `/usr/local/bin/lookout`, writes `/etc/lookout/lookout.yaml`, enrolls the server, and enables and starts the `lookout` systemd service. Options:
 
 | Flag | Meaning |
 | --- | --- |
 | `--url` | Platform base URL. Required on first install. |
-| `--token` | Enrollment token. Required until the server is enrolled. |
+| `--token` | Enrollment token. Required until the server is enrolled, unless `LOOKOUT_TOKEN` is set. `--token` wins when both are given. |
 | `--version` | Release to install, such as `0.2.0` or `latest`. Defaults to the version the script was released with. |
 
-Running the script again is safe. It upgrades the binary, keeps `/etc/lookout/lookout.yaml` and restarts the service. With no `--url` it reuses the `platform_url` from the config. Passing `--token` on an enrolled server re-enrolls it. Existing credentials are never pointed at a different platform: a different `--url` on an enrolled server is refused unless you also pass `--token`, and then the server is re-enrolled with the new platform (`lookout enroll --force` updates `platform_url`).
+Running the script again is safe. It upgrades the binary, keeps `/etc/lookout/lookout.yaml` and restarts the service. With no `--url` it reuses the `platform_url` from the config. Giving a token (`--token` or `LOOKOUT_TOKEN`) on an enrolled server re-enrolls it. Existing credentials are never pointed at a different platform: a different `--url` on an enrolled server is refused unless you also give a token, and then the server is re-enrolled with the new platform. `lookout enroll --force` changes `platform_url` only after the platform has accepted the token, so a failed re-enroll leaves the config and the old credentials as they were.
 
-The enrollment token is passed as a command-line argument, so it is visible in the process list while the script runs. This is accepted for now because the token is single-use, expires after 24 hours and the host is root-only. The script never prints it.
+To enroll by hand, run `lookout enroll --url https://media.example.com` with the token in `LOOKOUT_TOKEN` (or `--token <TOKEN>`), then `systemctl restart lookout`: a running agent keeps the identity it started with.
+
+### The enrollment token
+
+A token on a command line is not only visible in the process list while the command runs. `sudo` writes every command line it runs, arguments included, to the system log (`/var/log/auth.log` or the systemd journal), so `sudo sh install.sh --token <TOKEN>` leaves the token in a log that is kept long after the install. Shell history keeps it too. Handing it over in `LOOKOUT_TOKEN` from a root shell, as above, keeps it out of all three: install.sh passes it on to `lookout enroll` in the environment, not as an argument. The script never prints the token. It is single-use and expires after 24 hours, so a leaked token that has already been used is worthless, but a log entry written before the install finished may still hold a valid one.
 
 ### How the download is verified
 
@@ -36,6 +47,10 @@ The plugin needs Unraid 6.12 or later.
 3. Go to **Settings → User Utilities → Lookout**, enter the platform URL and the token, and click **Enroll**.
 
 The page shows whether the agent runs, its version, the server UUID, the platform URL, and the time and error of the last report. Enrolling again from the page re-enrolls the server (`lookout enroll --force`) and restarts the agent. The enrollment token is passed to `lookout enroll` as a command-line argument, so it shows in the process list while enrolling. It is never written to the log or shown on the page.
+
+The agent's credentials live in `/boot/config/plugins/lookout/state/credentials.json` on the flash drive, which Unraid can export over SMB as the `flash` share. Anyone who can read that share can read the agent token and report as this server. On the **Main** tab, click **Flash** and under **SMB Security Settings** set **Export** to **No**, or keep it exported with **Security** set to **Private** and access for trusted users only.
+
+The plugin itself is not signed. Unraid runs the `.plg` file and its install script as root, and checks for plugin updates against `releases/latest/download/lookout.plg` on GitHub. Installing or updating the plugin therefore trusts GitHub and HTTPS only: whoever can publish a release in `pentacore/lookout`, or change what GitHub serves, can run code as root on the server. This is how Unraid plugins work and the plugin cannot add a check of its own. The agent binary the plugin downloads is checked against `checksums.txt` from the same release, which guards against a corrupted download, not against a malicious release. Only the agent's own self-updates are verified with minisign.
 
 The plugin starts the agent at boot, not at array start, so it also runs while the array is stopped. A small supervisor restarts the agent 5 seconds after it exits. Use `/etc/rc.d/rc.lookout start|stop|restart|status` to control it by hand.
 
@@ -98,7 +113,7 @@ The tag must be `vX.Y.Z` or `vX.Y.Z-prerelease` (such as `v0.2.0-rc.1`). A tag w
 2. Signs a test file with the secret key and password, and verifies it with `MINISIGN_PUBLIC_KEY`. If the secrets and the variable don't belong together, the release stops here, before anything is built or published.
 3. Renders `install.sh` and `lookout.plg`, then builds, signs and uploads the release with GoReleaser as a **draft**. The public key and the version are built into the binary. Agents and `install.sh` can't see a draft.
 4. Verifies the archives exactly as uploaded with `scripts/verify-release-dist.sh`: the minisign signature and exact trusted comment of each archive, `checksums.txt`, that each archive holds only `lookout`, that both binaries embed `MINISIGN_PUBLIC_KEY`, and the agent's own verification code (`go test -tags release` in `internal/selfupdate`).
-5. Publishes the draft only when all of that passes. If a check fails, the draft stays unpublished: inspect it, delete it on GitHub, fix the problem and push a new tag (or delete and re-push the same one).
+5. Checks that the tag has exactly one draft release and publishes it, only when all of that passes. If a check fails, the draft stays unpublished: inspect it, delete it on GitHub, fix the problem and push a new tag (or delete and re-push the same one). Re-running the workflow for a tag replaces that tag's draft (`release.replace_existing_draft` in `.goreleaser.yaml`) instead of adding a second one.
 
 CI runs the same build and pre-publish check on every push, with a throwaway key and a snapshot build. To run it locally (needs Go 1.27.1 or later, or set `GORELEASER=goreleaser` to use an installed goreleaser; it rewrites `dist/` and `build/release-extra/`):
 
