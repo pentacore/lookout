@@ -8,6 +8,11 @@
 version: 2
 project_name: lookout
 
+# Sort v0.2.0-rc.1 before v0.2.0 when picking the previous tag. The release
+# workflow also pins the current tag with GORELEASER_CURRENT_TAG.
+git:
+  prerelease_suffix: "-"
+
 builds:
   - main: ./cmd/lookout
     binary: lookout
@@ -30,20 +35,23 @@ checksum:
 # The trusted comment must be exactly "lookout {version} {asset}": the agent's
 # self-update (internal/selfupdate) rejects any other, which binds each
 # signature to one version and one arch. Sign args get no artifact template
-# fields, so the asset name is the base of ${artifact} (its dist path).
-# packaging/test/release_test.sh checks the result.
+# fields, so the asset name is the base of .Env.artifact (its dist path).
+# scripts/verify-release-dist.sh checks the result.
 signs:
   - id: minisign
     artifacts: archive
     cmd: minisign
     signature: "${artifact}.minisig"
     stdin: "{{ .Env.MINISIGN_PASSWORD }}\n"
-    args: ["-S", "-s", "{{ .Env.MINISIGN_KEY_FILE }}", "-m", "${artifact}", "-x", "${signature}", "-t", 'lookout {{ .Version }} {{ base "${artifact}" }}']
+    args: ["-S", "-s", "{{ .Env.MINISIGN_KEY_FILE }}", "-m", "${artifact}", "-x", "${signature}", "-t", 'lookout {{ .Version }} {{ base .Env.artifact }}']
 
 release:
   github:
     owner: pentacore
     name: lookout
   prerelease: auto
+  # Published as a draft, which agents and install.sh can't see. The release
+  # workflow verifies dist/ and then publishes the draft.
+  draft: true
   extra_files:
     - glob: ./build/release-extra/*

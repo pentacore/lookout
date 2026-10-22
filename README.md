@@ -84,6 +84,7 @@ Releases are built by GoReleaser in the `Release` workflow (`.github/workflows/r
 3. Add repo **secrets** `MINISIGN_SECRET_KEY` (full contents of `lookout.key`) and `MINISIGN_PASSWORD`. Add repo **variable** `MINISIGN_PUBLIC_KEY` (the second line of `lookout.pub`, the base64 `RW…` string). Store `lookout.key` offline.
 4. Add the remote, push `main`, then tag `v0.1.0` and push the tag to cut the first release (see below).
 5. Optional: put the public key in the repo description or this README, so first installs can be checked out of band.
+6. Recommended: add a tag ruleset for `v*` so only you can create, move or delete release tags. For a second gate, move the two secrets into a `release` environment with required reviewers and add `environment: release` to the job in `release.yml`.
 
 ### Cutting a release
 
@@ -95,10 +96,11 @@ The tag must be `vX.Y.Z` or `vX.Y.Z-prerelease` (such as `v0.2.0-rc.1`). A tag w
 
 1. Refuses any other tag format.
 2. Signs a test file with the secret key and password, and verifies it with `MINISIGN_PUBLIC_KEY`. If the secrets and the variable don't belong together, the release stops here, before anything is built or published.
-3. Renders `install.sh` and `lookout.plg`, then builds, signs and publishes the release with GoReleaser. The public key and the version are built into the binary.
-4. After publishing, verifies each archive with `minisign` and with the agent's own verification code (`go test -tags release` in `internal/selfupdate`).
+3. Renders `install.sh` and `lookout.plg`, then builds, signs and uploads the release with GoReleaser as a **draft**. The public key and the version are built into the binary. Agents and `install.sh` can't see a draft.
+4. Verifies the archives exactly as uploaded with `scripts/verify-release-dist.sh`: the minisign signature and exact trusted comment of each archive, `checksums.txt`, that each archive holds only `lookout`, that both binaries embed `MINISIGN_PUBLIC_KEY`, and the agent's own verification code (`go test -tags release` in `internal/selfupdate`).
+5. Publishes the draft only when all of that passes. If a check fails, the draft stays unpublished: inspect it, delete it on GitHub, fix the problem and push a new tag (or delete and re-push the same one).
 
-To try the whole pipeline locally with a throwaway key (needs Go 1.27.1 or later; it rewrites `dist/` and `build/release-extra/`):
+CI runs the same build and pre-publish check on every push, with a throwaway key and a snapshot build. To run it locally (needs Go 1.27.1 or later, or set `GORELEASER=goreleaser` to use an installed goreleaser; it rewrites `dist/` and `build/release-extra/`):
 
 ```sh
 bash packaging/test/release_test.sh
