@@ -3,6 +3,8 @@ package platform
 import (
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -43,4 +45,27 @@ func Redact(text string, tokens ...string) string {
 		}
 	}
 	return text
+}
+
+// cutUTF8 returns at most the first n bytes of s, cut before any rune that
+// would not fit whole.
+func cutUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// printable drops every character that is not printable, such as control
+// characters and terminal escapes, and invalid UTF-8.
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || !unicode.IsPrint(r) {
+			return -1
+		}
+		return r
+	}, s)
 }

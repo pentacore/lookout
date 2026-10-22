@@ -21,6 +21,7 @@ const (
 	requestTimeout = 30 * time.Second
 	maxResponse    = 1 << 20 // successful response bodies
 	maxErrorBody   = 4 << 10 // StatusError.Body
+	maxLocation    = 200     // StatusError.Location
 	apiPath        = "/api/agent/v1"
 )
 
@@ -37,7 +38,7 @@ type StatusError struct {
 	Code       int
 	Body       string // at most 4 KiB
 	RetryAfter time.Duration
-	Location   string
+	Location   string // at most 200 bytes, control characters removed
 }
 
 func (e *StatusError) Error() string {
@@ -136,10 +137,14 @@ func (c *Client) post(ctx context.Context, path, bearer string, body any, wantSt
 
 func newStatusError(resp *http.Response, data []byte, secrets []string) *StatusError {
 	text := Redact(string(data[:min(len(data), maxResponse)]), secrets...)
+	location := printable(Redact(resp.Header.Get("Location"), secrets...))
+	if len(location) > maxLocation {
+		location = cutUTF8(location, maxLocation) + "…"
+	}
 	return &StatusError{
 		Code:       resp.StatusCode,
-		Body:       text[:min(len(text), maxErrorBody)],
+		Body:       cutUTF8(text, maxErrorBody),
 		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
-		Location:   resp.Header.Get("Location"),
+		Location:   location,
 	}
 }

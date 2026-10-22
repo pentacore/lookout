@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pentacore/lookout/internal/wire"
 )
@@ -303,5 +304,45 @@ func TestReportContextCancelled(t *testing.T) {
 	_, err := NewClient(srv.URL).Report(ctx, "a.b", wire.ReportRequest{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+func TestStatusErrorBodyCutOnRuneBoundary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		_, _ = io.WriteString(w, "x"+strings.Repeat("é", 5000))
+	}))
+	defer srv.Close()
+	_, err := NewClient(srv.URL).Report(context.Background(), "a.b", wire.ReportRequest{})
+	var se *StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want a *StatusError", err)
+	}
+	if len(se.Body) > 4096 || len(se.Body) < 4090 || !utf8.ValidString(se.Body) {
+		t.Fatalf("body len = %d, valid UTF-8 = %v; want at most 4096 bytes of valid UTF-8", len(se.Body), utf8.ValidString(se.Body))
+	}
+}
+
+// The Location header is platform-supplied text that ends up in logs and on
+// the Unraid page: it is capped and stripped of control characters.
+func TestStatusErrorLocationSanitized(t *testing.T) {
+	tests := []struct {
+		name, location, want string
+	}{
+		{"plain", "https://other.example/api", "https://other.example/api"},
+		{"control characters", "https://x.example/\x1b[31mred\r\n\x00", "https://x.example/[31mred"},
+		{"long", "https://x.example/" + strings.Repeat("é", 300), "https://x.example/" + strings.Repeat("é", 91) + "…"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: 302, Header: http.Header{"Location": []string{tt.location}}}
+			se := newStatusError(resp, nil, nil)
+			if se.Location != tt.want {
+				t.Fatalf("Location = %q, want %q", se.Location, tt.want)
+			}
+			if !strings.Contains(se.Error(), tt.want) || !utf8.ValidString(se.Error()) {
+				t.Fatalf("Error() = %q", se.Error())
+			}
+		})
 	}
 }
