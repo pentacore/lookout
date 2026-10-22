@@ -1,13 +1,17 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/pentacore/lookout/internal/wire"
@@ -48,6 +52,7 @@ func TestLoadCredentialsCorrupt(t *testing.T) {
 	}{
 		{"token does not belong to uuid", `{"server_uuid":"a","agent_token":"b.secret"}`, "agent_token"},
 		{"empty token", `{"server_uuid":"a","agent_token":""}`, "agent_token"},
+		{"empty server uuid", `{"server_uuid":"","agent_token":".secret"}`, "server_uuid"},
 		{"not json", `{`, "credentials"},
 	}
 	for _, tt := range tests {
@@ -180,6 +185,70 @@ func TestWriteFileAtomicMissingDir(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nope", "target.json")
 	if err := WriteFileAtomic(path, []byte("x"), 0o600); err == nil {
 		t.Fatal("want an error when the directory does not exist")
+	}
+}
+
+func TestRemoveCredentials(t *testing.T) {
+	store := Store{Dir: t.TempDir()}
+	if err := store.SaveCredentials(Credentials{ServerUUID: "a", AgentToken: "a.secret"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveCredentials(); err != nil {
+		t.Fatalf("RemoveCredentials: %v", err)
+	}
+	if _, err := store.LoadCredentials(); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("LoadCredentials after remove = %v, want fs.ErrNotExist", err)
+	}
+	if err := store.RemoveCredentials(); err != nil {
+		t.Fatalf("RemoveCredentials without a file = %v, want nil", err)
+	}
+}
+
+// Once the rename has happened the new content is in place, so a directory
+// fsync failure does not fail the write. File systems that cannot fsync a
+// directory are tolerated silently; any other failure is logged.
+func TestWriteFileAtomicDirSyncFailureAfterRename(t *testing.T) {
+	tests := []struct {
+		name    string
+		syncErr error
+		wantLog bool
+	}{
+		{"EINVAL", fmt.Errorf("sync: %w", syscall.EINVAL), false},
+		{"unsupported", fmt.Errorf("sync: %w", errors.ErrUnsupported), false},
+		{"EIO", fmt.Errorf("sync: %w", syscall.EIO), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origSync, origLogger := syncDirFunc, slog.Default()
+			t.Cleanup(func() { syncDirFunc = origSync; slog.SetDefault(origLogger) })
+			syncDirFunc = func(string) error { return tt.syncErr }
+			var logs bytes.Buffer
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+
+			path := filepath.Join(t.TempDir(), "target.json")
+			if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := WriteFileAtomic(path, []byte("new"), 0o600); err != nil {
+				t.Fatalf("WriteFileAtomic = %v, want nil after a successful rename", err)
+			}
+			if got, _ := os.ReadFile(path); string(got) != "new" {
+				t.Fatalf("content = %q, want new", got)
+			}
+			if logged := strings.Contains(logs.String(), "level=WARN"); logged != tt.wantLog {
+				t.Fatalf("log = %q, want a warning: %v", logs.String(), tt.wantLog)
+			}
+		})
+	}
+}
+
+func TestWriteFileAtomicSetsRequestedMode(t *testing.T) {
+	for _, perm := range []fs.FileMode{0o600, 0o644} {
+		path := filepath.Join(t.TempDir(), "target")
+		if err := WriteFileAtomic(path, []byte("x"), perm); err != nil {
+			t.Fatal(err)
+		}
+		assertMode(t, path, perm)
 	}
 }
 

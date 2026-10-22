@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/pentacore/lookout/internal/wire"
 )
@@ -44,12 +46,15 @@ type Store struct {
 }
 
 // LoadCredentials returns the saved credentials. A missing file yields an
-// error wrapping fs.ErrNotExist; a file whose token does not belong to its
-// server UUID is an error.
+// error wrapping fs.ErrNotExist; an empty server UUID, or a token that does
+// not belong to the server UUID, is an error.
 func (s Store) LoadCredentials() (Credentials, error) {
 	var c Credentials
 	if err := s.load(credentialsFile, &c); err != nil {
 		return Credentials{}, err
+	}
+	if c.ServerUUID == "" {
+		return Credentials{}, errors.New("credentials: server_uuid is empty")
 	}
 	if !strings.HasPrefix(c.AgentToken, c.ServerUUID+".") {
 		return Credentials{}, fmt.Errorf("credentials: agent_token does not start with server_uuid and a dot")
@@ -61,6 +66,16 @@ func (s Store) LoadCredentials() (Credentials, error) {
 // state directory with mode 0700 when needed.
 func (s Store) SaveCredentials(c Credentials) error {
 	return s.save(credentialsFile, c)
+}
+
+// RemoveCredentials deletes the credentials file. A missing file is not an
+// error.
+func (s Store) RemoveCredentials() error {
+	err := os.Remove(filepath.Join(s.Dir, credentialsFile))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // LoadPlatformConfig returns the saved platform configuration, or the
@@ -110,7 +125,10 @@ func (s Store) save(name string, v any) error {
 
 // WriteFileAtomic replaces path with data. It writes a temporary file in the
 // same directory, fsyncs it, sets perm, renames it over path and fsyncs the
-// directory, so a power loss leaves either the old or the new content.
+// directory, so a power loss leaves either the old or the new content. Once
+// the rename has happened the write counts as done: a directory fsync that
+// the file system does not support is ignored and any other fsync failure is
+// logged, not returned.
 func WriteFileAtomic(path string, data []byte, perm fs.FileMode) (err error) {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
@@ -130,8 +148,12 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) (err error) {
 	if err = tmp.Sync(); err != nil {
 		return err
 	}
-	if err = tmp.Chmod(perm); err != nil {
-		return err
+	// CreateTemp already made the file 0600; skipping the chmod then also
+	// spares file systems with fixed modes (the vfat flash on Unraid).
+	if perm != filePerm {
+		if err = tmp.Chmod(perm); err != nil {
+			return err
+		}
 	}
 	if err = tmp.Close(); err != nil {
 		return err
@@ -139,8 +161,15 @@ func WriteFileAtomic(path string, data []byte, perm fs.FileMode) (err error) {
 	if err = os.Rename(tmp.Name(), path); err != nil {
 		return err
 	}
-	return syncDir(dir)
+	if syncErr := syncDirFunc(dir); syncErr != nil &&
+		!errors.Is(syncErr, syscall.EINVAL) && !errors.Is(syncErr, errors.ErrUnsupported) {
+		slog.Warn("wrote file but could not fsync its directory", "path", path, "error", syncErr)
+	}
+	return nil
 }
+
+// syncDirFunc is syncDir; tests replace it to simulate fsync failures.
+var syncDirFunc = syncDir
 
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
