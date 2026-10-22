@@ -10,6 +10,14 @@ fi
 version="${1#v}"
 outdir="$2"
 : "${MINISIGN_PUBLIC_KEY:?MINISIGN_PUBLIC_KEY must be set}"
+if ! [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+	echo "invalid version: $version" >&2
+	exit 2
+fi
+if ! [[ $MINISIGN_PUBLIC_KEY =~ ^[A-Za-z0-9+/=]+$ ]]; then
+	echo "invalid MINISIGN_PUBLIC_KEY (expected base64)" >&2
+	exit 2
+fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 mkdir -p "$outdir"

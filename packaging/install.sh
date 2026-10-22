@@ -65,6 +65,17 @@ verify_sha256() {
 	[ "$vs_got" = "$vs_want" ]
 }
 
+# valid_url URL accepts https:// URLs, and http:// only for loopback hosts.
+valid_url() {
+	case "$1" in
+	*[[:space:]@]*) return 1 ;;
+	https://?*) return 0 ;;
+	http://localhost | http://localhost[:/]* | http://127.0.0.1 | http://127.0.0.1[:/]*) return 0 ;;
+	'http://[::1]' | 'http://[::1]'[:/]*) return 0 ;;
+	esac
+	return 1
+}
+
 # config_url PATH prints the platform_url of an existing config, if any.
 config_url() {
 	sed -n 's/^platform_url:[[:space:]]*//p' "$1" | head -n 1 | sed -e 's/[[:space:]]*$//' -e "s/^[\"']//" -e "s/[\"']\$//"
@@ -137,14 +148,21 @@ main() {
 	done
 
 	[ "$(id -u)" = 0 ] || die "must run as root (try: sudo sh install.sh ...)"
+	command -v systemctl >/dev/null 2>&1 || die "systemd is required (systemctl not found)"
+	[ -n "$DESTDIR" ] || [ -d /run/systemd/system ] || die "systemd is required (this system is not running it)"
 
 	# An unrendered script still carries its placeholder: treat it as latest.
 	case "$version" in
 	'' | latest | @*@) version=latest ;;
+	*[!0-9A-Za-z.+-]*) die "invalid --version" ;;
 	esac
-	case "$platform_url" in
-	*[[:space:]]*) die "--url must not contain whitespace" ;;
-	esac
+	if [ -n "$platform_url" ]; then
+		valid_url "$platform_url" || die "--url must be https:// (http:// is allowed only for localhost, 127.0.0.1 and [::1]) and contain no spaces or '@'"
+	fi
+	if [ ! -f "$CONFIG_PATH" ]; then
+		[ -n "$platform_url" ] || die "--url is required on first install"
+		[ -n "$token" ] || die "--token is required (this server is not enrolled yet)"
+	fi
 
 	arch=$(detect_arch) || exit 1
 	name="lookout_linux_$arch.tar.gz"
@@ -157,8 +175,9 @@ main() {
 
 	tmp=$(mktemp -d)
 	trap 'rm -rf "$tmp"' EXIT
+	trap 'exit 1' INT TERM HUP
 	for file in "$name" checksums.txt "$name.minisig"; do
-		curl -fsSL -o "$tmp/$file" "$base/$file" || die "download failed: $file"
+		curl --proto '=https' --tlsv1.2 -fsSL -o "$tmp/$file" "$base/$file" || die "download failed: $file"
 	done
 
 	case "$MINISIGN_PUBLIC_KEY" in
@@ -169,38 +188,50 @@ main() {
 		minisign -Vm "$tmp/$name" -P "$MINISIGN_PUBLIC_KEY" >/dev/null || die "minisign verification failed for $name"
 	else
 		verify_sha256 "$tmp/$name" "$tmp/checksums.txt" "$name" || die "sha256 verification failed for $name"
-		echo "warning: minisign not installed; verified sha256 only" >&2
+		if [ "$have_key" = yes ]; then
+			echo "warning: minisign not installed; verified sha256 only" >&2
+		else
+			echo "warning: no signing key in this script; verified sha256 only" >&2
+		fi
 	fi
 
 	tar -xzf "$tmp/$name" -C "$tmp" lookout || die "could not extract $name"
 	mkdir -p "$(dirname "$BIN_PATH")"
-	install -m 0755 "$tmp/lookout" "$BIN_PATH"
+	install -m 0755 "$tmp/lookout" "$BIN_PATH.new"
+	mv -f "$BIN_PATH.new" "$BIN_PATH"
 
+	# Existing credentials must never be pointed at a different platform, so a
+	# changed --url is only ever applied by re-enrolling (enroll --force).
+	switching=no
 	if [ ! -f "$CONFIG_PATH" ]; then
-		[ -n "$platform_url" ] || die "--url is required on first install"
 		write_config "$CONFIG_PATH" "$platform_url"
 	else
 		existing_url=$(config_url "$CONFIG_PATH")
-		if [ -n "$platform_url" ] && [ "$platform_url" != "$existing_url" ]; then
-			write_config "$CONFIG_PATH" "$platform_url"
+		if [ -n "$platform_url" ] && [ "${platform_url%/}" != "${existing_url%/}" ]; then
+			switching=yes
 		else
 			platform_url="$existing_url"
 		fi
 	fi
 
+	if ! check_out=$("$BIN_PATH" check-config --config "$CONFIG_PATH" 2>"$tmp/check-config.err"); then
+		die "check-config failed: $(cat "$tmp/check-config.err")"
+	fi
 	enrolled=no
-	if "$BIN_PATH" check-config --config "$CONFIG_PATH" 2>/dev/null | grep -q '^enrolled: *yes'; then
+	if printf '%s\n' "$check_out" | grep -q '^enrolled: *yes'; then
 		enrolled=yes
 	fi
-	if [ -n "$token" ]; then
+
+	if [ -z "$token" ]; then
+		[ "$enrolled" = no ] || [ "$switching" = no ] || die "--url changes the platform; pass --token to re-enroll"
+		[ "$enrolled" = yes ] || die "--token is required (this server is not enrolled yet)"
+	else
 		[ -n "$platform_url" ] || die "no platform_url in $CONFIG_PATH; pass --url"
-		if [ "$enrolled" = yes ]; then
+		if [ "$enrolled" = yes ] || [ "$switching" = yes ]; then
 			"$BIN_PATH" enroll --config "$CONFIG_PATH" --url "$platform_url" --token "$token" --force
 		else
 			"$BIN_PATH" enroll --config "$CONFIG_PATH" --url "$platform_url" --token "$token"
 		fi
-	elif [ "$enrolled" = no ]; then
-		die "--token is required (this server is not enrolled yet)"
 	fi
 
 	write_unit

@@ -7,7 +7,7 @@ lookout is a small host monitoring agent. It runs on a Debian/Ubuntu server or a
 The install script supports `amd64` and `arm64` systems that run systemd. Create an enrollment token on the platform, then run:
 
 ```sh
-curl -fsSLO https://github.com/pentacore/lookout/releases/latest/download/install.sh
+curl --proto '=https' --tlsv1.2 -fsSLO https://github.com/pentacore/lookout/releases/latest/download/install.sh
 sudo sh install.sh --url https://media.pentacore.se --token <TOKEN>
 ```
 
@@ -19,7 +19,7 @@ The script downloads the release archive, verifies it, installs `/usr/local/bin/
 | `--token` | Enrollment token. Required until the server is enrolled. |
 | `--version` | Release to install, such as `0.2.0` or `latest`. Defaults to the version the script was released with. |
 
-Running the script again is safe. It upgrades the binary, keeps `/etc/lookout/lookout.yaml` and restarts the service. With no `--url` it reuses the `platform_url` from the config, and a different `--url` replaces only that line. Passing `--token` on an enrolled server re-enrolls it.
+Running the script again is safe. It upgrades the binary, keeps `/etc/lookout/lookout.yaml` and restarts the service. With no `--url` it reuses the `platform_url` from the config. Passing `--token` on an enrolled server re-enrolls it. Existing credentials are never pointed at a different platform: a different `--url` on an enrolled server is refused unless you also pass `--token`, and then the server is re-enrolled with the new platform (`lookout enroll --force` updates `platform_url`).
 
 The enrollment token is passed as a command-line argument, so it is visible in the process list while the script runs. This is accepted for now because the token is single-use, expires after 24 hours and the host is root-only. The script never prints it.
 

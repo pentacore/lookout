@@ -84,6 +84,16 @@ fi
 rc=$?
 [ "$rc" -ne 0 ] || fail "render without key must fail"
 
+for badver in 1.2 v1.2.3.4 '1.2.3;rm' '../x'; do
+	if MINISIGN_PUBLIC_KEY=RWQtest "$root/scripts/render-release-files.sh" "$badver" "$work/out3" 2>/dev/null; then
+		fail "render must reject version [$badver]"
+	fi
+done
+if MINISIGN_PUBLIC_KEY='RW|Q&test' "$root/scripts/render-release-files.sh" 0.1.0 "$work/out3" 2>/dev/null; then
+	fail "render must reject a malformed key"
+fi
+MINISIGN_PUBLIC_KEY=RWQt+e/s=t "$root/scripts/render-release-files.sh" v0.2.0-rc.1 "$work/out3" || fail "render must accept v-prefixed prerelease and base64 key"
+
 # Full flow of the rendered script against fakes (no root, no network, no systemd).
 fx="$work/fx"
 mkdir -p "$fx/release/pkg" "$fx/bin"
@@ -92,6 +102,7 @@ cat >"$fx/release/pkg/lookout" <<'FAKE'
 case "$1" in
 version) echo "lookout 0.1.0" ;;
 check-config)
+	if [ -n "${FAKE_CHECK_CONFIG_RC:-}" ]; then echo "config exploded" >&2; exit "$FAKE_CHECK_CONFIG_RC"; fi
 	if [ -f "$LOOKOUT_DESTDIR/enrolled" ]; then echo "enrolled:     yes (server abc)"; else echo "enrolled:     no"; fi
 	;;
 enroll)
@@ -118,6 +129,7 @@ for a in "$@"; do
 	url="$a"
 done
 echo "$url" >>"$FAKE_LOG/curl"
+echo "$*" >>"$FAKE_LOG/curl-args"
 cp "$FAKE_RELEASE/$(basename "$url")" "$out"
 FAKE
 cat >"$fx/bin/systemctl" <<'FAKE'
@@ -146,6 +158,21 @@ run_install() {
 			sh "$work/out/install.sh" "$@"
 	) >"$ri_dir/stdout" 2>"$ri_dir/stderr"
 	return $?
+}
+# run_install_root DIR ROOT ARGS... is run_install against an existing install root.
+run_install_root() {
+	rr_dir="$1"
+	rr_root="$2"
+	shift 2
+	mkdir -p "$rr_dir"
+	: >"$rr_dir/curl"
+	: >"$rr_dir/systemctl"
+	(
+		unset LOOKOUT_INSTALL_LIB_ONLY
+		PATH="$withminisign" LOOKOUT_DESTDIR="$rr_root" LOOKOUT_UNAME_M=x86_64 \
+			FAKE_LOG="$rr_dir" FAKE_RELEASE="$fx/release" \
+			sh "$work/out/install.sh" "$@"
+	) >"$rr_dir/stdout" 2>"$rr_dir/stderr"
 }
 nominisign="$work/nominisign"
 mkdir -p "$nominisign"
@@ -193,9 +220,11 @@ if (FAKE_RELEASE_OVERRIDE="$fx/release-bad" && export FAKE_RELEASE_OVERRIDE && r
 fi
 [ ! -e "$work/run4/root/usr/local/bin/lookout" ] || fail "run4 installed despite bad checksum"
 
-# Re-run without --url or --token: reads the URL from the config, stays enrolled.
+# Re-run without --url or --token: keeps the config, does not enroll, restarts the service.
 cp -R "$work/run1/root" "$work/rerun-root"
+rm -f "$work/rerun-root/calls"
 mkdir -p "$work/run5"
+: >"$work/run5/systemctl"
 (
 	unset LOOKOUT_INSTALL_LIB_ONLY
 	PATH="$withminisign" LOOKOUT_DESTDIR="$work/rerun-root" LOOKOUT_UNAME_M=x86_64 \
@@ -203,9 +232,13 @@ mkdir -p "$work/run5"
 		sh "$work/out/install.sh"
 ) >"$work/run5/stdout" 2>"$work/run5/stderr"
 assert_eq "run5 status" 0 $?
+[ ! -e "$work/rerun-root/calls" ] || fail "run5 must not call enroll"
+assert_eq "run5 config unchanged" "$(cat "$work/run1/root/etc/lookout/lookout.yaml")" "$(cat "$work/rerun-root/etc/lookout/lookout.yaml")"
+assert_eq "run5 systemctl" "daemon-reload
+enable lookout
+restart lookout" "$(cat "$work/run5/systemctl")"
 
 # Re-run with a token on an enrolled host re-enrolls with --force and the config URL.
-rm -f "$work/rerun-root/calls"
 (
 	unset LOOKOUT_INSTALL_LIB_ONLY
 	PATH="$withminisign" LOOKOUT_DESTDIR="$work/rerun-root" LOOKOUT_UNAME_M=x86_64 \
@@ -214,6 +247,53 @@ rm -f "$work/rerun-root/calls"
 ) >/dev/null 2>&1
 assert_eq "run6 status" 0 $?
 assert_contains "run6 force and config url" "--url https://media.example.com --token T2 --force" "$(cat "$work/rerun-root/calls")"
+
+# A different --url on an enrolled host without --token is refused: the old
+# credentials must not be sent to another platform. Nothing changes.
+cp -R "$work/run1/root" "$work/switch-root"
+rm -f "$work/switch-root/calls"
+if run_install_root "$work/run11" "$work/switch-root" --url https://other.example.com; then
+	fail "run11 must refuse to switch platform without --token"
+fi
+assert_contains "run11 message" "--url changes the platform; pass --token to re-enroll" "$(cat "$work/run11/stderr")"
+assert_eq "run11 config unchanged" "$(cat "$work/run1/root/etc/lookout/lookout.yaml")" "$(cat "$work/switch-root/etc/lookout/lookout.yaml")"
+[ ! -e "$work/switch-root/calls" ] || fail "run11 must not call enroll"
+assert_eq "run11 no systemctl" "" "$(cat "$work/run11/systemctl")"
+
+# With --token the switch re-enrolls with --force; install.sh leaves the config to enroll.
+run_install_root "$work/run12" "$work/switch-root" --url https://other.example.com --token T3
+assert_eq "run12 status" 0 $?
+assert_contains "run12 enroll" "--url https://other.example.com --token T3 --force" "$(cat "$work/switch-root/calls")"
+assert_eq "run12 config left to enroll" "$(cat "$work/run1/root/etc/lookout/lookout.yaml")" "$(cat "$work/switch-root/etc/lookout/lookout.yaml")"
+
+# A trailing slash is the same platform, not a switch.
+cp -R "$work/run1/root" "$work/slash-root"
+run_install_root "$work/run13" "$work/slash-root" --url https://media.example.com/
+assert_eq "run13 status" 0 $?
+
+# Invalid URLs are rejected before anything is downloaded or written.
+for bad in http://evil.example.com ftp://x.example.com https://user@evil.example.com http://localhost@evil.example.com 'https://a b'; do
+	if run_install "$work/run14" "$withminisign" --url "$bad" --token T; then
+		fail "run14 must reject url [$bad]"
+	fi
+	assert_contains "run14 message" "--url must be https://" "$(cat "$work/run14/stderr")"
+	assert_eq "run14 no download" "" "$(cat "$work/run14/curl")"
+	[ ! -e "$work/run14/root/etc/lookout/lookout.yaml" ] || fail "run14 wrote a config for [$bad]"
+done
+for ok in http://localhost:8080 http://127.0.0.1 'http://[::1]:9000/x'; do
+	run_install "$work/run15" "$withminisign" --url "$ok" --token T || fail "run15 must accept url [$ok]"
+done
+
+# Downloads are pinned to HTTPS.
+assert_contains "curl pinned to https" "--proto =https --tlsv1.2 -fsSL" "$(cat "$work/run1/curl-args")"
+
+# A failing check-config is reported, not mistaken for "not enrolled".
+cp -R "$work/run1/root" "$work/broken-root"
+if (FAKE_CHECK_CONFIG_RC=1 && export FAKE_CHECK_CONFIG_RC && run_install_root "$work/run16" "$work/broken-root" --token T); then
+	fail "run16 must fail when check-config fails"
+fi
+assert_contains "run16 message" "check-config failed: config exploded" "$(cat "$work/run16/stderr")"
+assert_eq "run16 no systemctl" "" "$(cat "$work/run16/systemctl")"
 
 # First install without --url or without --token fails with a clear message.
 if run_install "$work/run7" "$withminisign" --token T; then
@@ -241,7 +321,7 @@ mkdir -p "$work/run10" && : >"$work/run10/curl"
 ) >/dev/null 2>"$work/run10/stderr"
 assert_eq "run10 status" 0 $?
 assert_contains "run10 latest" "/releases/latest/download/lookout_linux_amd64.tar.gz" "$(cat "$work/run10/curl")"
-assert_contains "run10 sha256 only" "verified sha256 only" "$(cat "$work/run10/stderr")"
+assert_contains "run10 no key warning" "no signing key in this script; verified sha256 only" "$(cat "$work/run10/stderr")"
 [ ! -s "$work/run10/minisign" ] || fail "run10 must not run minisign without a key"
 
 echo "install_test: ok"
