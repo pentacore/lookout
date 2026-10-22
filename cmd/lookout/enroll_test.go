@@ -12,11 +12,15 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/pentacore/lookout/internal/config"
 	"github.com/pentacore/lookout/internal/state"
 	"github.com/pentacore/lookout/internal/wire"
 )
 
 const enrollToken = "enr-0123456789abcdef"
+
+// enrolledOutput is what a successful enroll prints on a systemd host.
+const enrolledOutput = "enrolled as srv-1\nrestart lookout (systemctl restart lookout) to apply\n"
 
 // testEnv is a config file plus state and runtime directories in a temp dir.
 type testEnv struct {
@@ -103,8 +107,8 @@ func TestEnrollCreatesCredentials(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr)
 	}
-	if stdout != "enrolled as srv-1\n" {
-		t.Errorf("stdout = %q", stdout)
+	if stdout != enrolledOutput {
+		t.Errorf("stdout = %q, want %q", stdout, enrolledOutput)
 	}
 
 	creds, err := env.store.LoadCredentials()
@@ -196,7 +200,7 @@ func TestEnrollForceResetsConfigVersion(t *testing.T) {
 	}
 
 	code, stdout, stderr := runCLI("enroll", "--force", "--config", env.config, "--url", srv.URL, "--token", enrollToken)
-	if code != 0 || stdout != "enrolled as srv-1\n" {
+	if code != 0 || stdout != enrolledOutput {
 		t.Fatalf("exit code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
 	}
 	pc, err := env.store.LoadPlatformConfig()
@@ -297,6 +301,7 @@ func TestEnrollRejectsPlainHTTP(t *testing.T) {
 }
 
 func TestEnrollMissingFlags(t *testing.T) {
+	t.Setenv("LOOKOUT_TOKEN", "")
 	env := newTestEnv(t, "")
 	tests := []struct {
 		name string
@@ -309,9 +314,113 @@ func TestEnrollMissingFlags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			code, _, stderr := runCLI(tt.args...)
-			if code != 2 || !strings.Contains(stderr, "--url and --token are required") {
+			if code != 2 || !strings.Contains(stderr, "--url and --token (or LOOKOUT_TOKEN) are required") {
 				t.Fatalf("exit code = %d, stderr = %q", code, stderr)
 			}
 		})
+	}
+}
+
+// A failed re-enroll against a new platform must leave the config untouched:
+// otherwise the old credentials would be sent to the new platform after the
+// next restart.
+func TestEnrollForceFailureKeepsConfig(t *testing.T) {
+	unreachable := httptest.NewServer(http.NotFoundHandler())
+	unreachableURL := unreachable.URL
+	unreachable.Close()
+
+	tests := []struct {
+		name string
+		url  func(t *testing.T) string
+	}{
+		{"token gone", func(t *testing.T) string { srv, _ := enrollServer(t, http.StatusGone, 60); return srv.URL }},
+		{"token unknown", func(t *testing.T) string { srv, _ := enrollServer(t, http.StatusNotFound, 60); return srv.URL }},
+		{"unreachable", func(*testing.T) string { return unreachableURL }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newTestEnv(t, "https://old.example", "# keep this comment")
+			env.saveCredentials("old-uuid")
+			before, err := os.ReadFile(env.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			code, _, stderr := runCLI("enroll", "--force", "--config", env.config, "--url", tt.url(t), "--token", enrollToken)
+			if code != 1 {
+				t.Fatalf("exit code = %d, stderr = %q", code, stderr)
+			}
+			after, err := os.ReadFile(env.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Errorf("config changed:\nbefore %q\nafter  %q", before, after)
+			}
+			if creds, err := env.store.LoadCredentials(); err != nil || creds.ServerUUID != "old-uuid" {
+				t.Errorf("credentials = %+v, %v; want the old ones kept", creds, err)
+			}
+		})
+	}
+}
+
+// install.sh hands the token over in LOOKOUT_TOKEN so that it never shows in
+// the process list or in sudo's log.
+func TestEnrollTokenFromEnvironment(t *testing.T) {
+	srv, calls := enrollServer(t, http.StatusCreated, 60)
+	env := newTestEnv(t, "")
+	t.Setenv("LOOKOUT_TOKEN", enrollToken)
+
+	code, stdout, stderr := runCLI("enroll", "--config", env.config, "--url", srv.URL)
+	if code != 0 || stdout != enrolledOutput || calls.Load() != 1 {
+		t.Fatalf("exit code = %d, stdout = %q, stderr = %q, calls = %d", code, stdout, stderr, calls.Load())
+	}
+	if creds, err := env.store.LoadCredentials(); err != nil || creds.ServerUUID != "srv-1" {
+		t.Errorf("credentials = %+v, %v", creds, err)
+	}
+}
+
+// The Unraid enroll wrapper restarts the agent itself, so only systemd hosts
+// get the restart hint.
+func TestEnrollRestartHintOnlyOnSystemd(t *testing.T) {
+	srv, _ := enrollServer(t, http.StatusCreated, 60)
+	env := newTestEnv(t, "")
+	orig := detectPlatform
+	detectPlatform = func() config.Platform { return config.PlatformUnraid }
+	t.Cleanup(func() { detectPlatform = orig })
+
+	code, stdout, stderr := runCLI("enroll", "--config", env.config, "--url", srv.URL, "--token", enrollToken)
+	if code != 0 || stdout != "enrolled as srv-1\n" {
+		t.Fatalf("exit code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+}
+
+// When platform_url cannot be saved after a successful enroll, the new
+// credentials are removed so that they are never sent to the old platform.
+func TestEnrollURLWriteFailureRemovesCredentials(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	srv, _ := enrollServer(t, http.StatusCreated, 60)
+	env := newTestEnv(t, "https://old.example")
+	env.saveCredentials("old-uuid")
+	before, err := os.ReadFile(env.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(env.dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(env.dir, 0o755) })
+
+	code, stdout, stderr := runCLI("enroll", "--force", "--config", env.config, "--url", srv.URL, "--token", enrollToken)
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "cannot save platform_url") {
+		t.Fatalf("exit code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	if after, _ := os.ReadFile(env.config); !bytes.Equal(before, after) {
+		t.Errorf("config changed: %q", after)
+	}
+	if creds, err := env.store.LoadCredentials(); err == nil {
+		t.Errorf("credentials %+v kept, want them removed", creds)
 	}
 }

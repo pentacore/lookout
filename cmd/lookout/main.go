@@ -39,8 +39,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 // parseFlags parses args with fs and maps the outcome to an exit code. No
-// subcommand takes positional arguments, so any are a usage error. ok is false
-// when the caller should return code immediately.
+// subcommand takes positional arguments, so any are a usage error; the
+// argument is not echoed, as it may be a misplaced token and stderr ends up
+// in syslog. ok is false when the caller should return code immediately.
 func parseFlags(fs *flag.FlagSet, args []string) (code int, ok bool) {
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -49,15 +50,18 @@ func parseFlags(fs *flag.FlagSet, args []string) (code int, ok bool) {
 		return 2, false
 	}
 	if fs.NArg() > 0 {
-		_, _ = fmt.Fprintf(fs.Output(), "lookout %s: unexpected argument %q\n", fs.Name(), fs.Arg(0))
+		_, _ = fmt.Fprintf(fs.Output(), "lookout %s: takes no positional arguments\n", fs.Name())
 		return 2, false
 	}
 	return 0, true
 }
 
+// detectPlatform reports the kind of host this is. Tests replace it.
+var detectPlatform = func() config.Platform { return config.DetectPlatform("/") }
+
 // defaultConfigPath is the config location for the platform this host runs.
 func defaultConfigPath() string {
-	return config.DefaultPath(config.DetectPlatform("/"))
+	return config.DefaultPath(detectPlatform())
 }
 
 // newFlagSet returns a flag set that reports errors on stderr instead of exiting.

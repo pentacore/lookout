@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,12 +51,35 @@ func runService(args []string, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
+	// Packages without an injected logger (internal/state) log through the default.
+	slog.SetDefault(logger)
+
+	cfgPath, err := leaveWorkingDir(*path)
+	if err != nil {
+		logger.Warn("staying in the current working directory", "error", err)
+	}
 
 	updater := &selfupdate.Updater{Logger: logger}
 	if config.DetectPlatform("/") == config.PlatformUnraid {
 		updater.PersistCopy = unraidPersistCopy
 	}
-	return runAgent(ctx, *path, logger, updater.Loop)
+	return runAgent(ctx, cfgPath, logger, updater.Loop)
+}
+
+// leaveWorkingDir changes to / so that the long-running agent never keeps
+// the directory it was started from busy (an Unraid disk or the flash drive
+// that is about to be unmounted). It returns cfgPath made absolute first. On
+// an error the working directory and cfgPath are left as they were; that is
+// not a reason to stop the agent.
+func leaveWorkingDir(cfgPath string) (string, error) {
+	abs, err := filepath.Abs(cfgPath)
+	if err != nil {
+		return cfgPath, fmt.Errorf("resolve %s: %w", cfgPath, err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		return cfgPath, fmt.Errorf("change to /: %w", err)
+	}
+	return abs, nil
 }
 
 // runAgent waits for a valid config, then runs the report loop. It returns 0

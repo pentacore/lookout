@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"strings"
 	"time"
 
@@ -17,22 +18,31 @@ import (
 	"github.com/pentacore/lookout/internal/wire"
 )
 
-const enrollTimeout = time.Minute
+const (
+	enrollTimeout = time.Minute
+	// tokenEnv carries the enrollment token as an alternative to --token,
+	// which keeps it out of the process list and out of sudo's log.
+	tokenEnv = "LOOKOUT_TOKEN"
+)
 
 // runEnroll exchanges a one-time enrollment token for agent credentials and
 // saves them. Overwriting existing credentials or switching platform_url needs
 // --force; re-enrolling resets the applied platform config to version 0.
+// Nothing is written unless the platform accepted the token.
 func runEnroll(args []string, stdout, stderr io.Writer) int {
 	flags := newFlagSet("enroll", stderr)
 	platformURL := flags.String("url", "", "platform URL, e.g. https://media.example.com (required)")
-	token := flags.String("token", "", "enrollment token from the platform (required)")
+	token := flags.String("token", "", "enrollment token from the platform (required unless "+tokenEnv+" is set)")
 	path := flags.String("config", defaultConfigPath(), "path to lookout.yaml")
 	force := flags.Bool("force", false, "overwrite existing credentials or switch platform_url")
 	if code, ok := parseFlags(flags, args); !ok {
 		return code
 	}
+	if *token == "" {
+		*token = os.Getenv(tokenEnv)
+	}
 	if *platformURL == "" || *token == "" {
-		_, _ = fmt.Fprintln(stderr, "lookout enroll: --url and --token are required")
+		_, _ = fmt.Fprintln(stderr, "lookout enroll: --url and --token (or "+tokenEnv+") are required")
 		flags.Usage()
 		return 2
 	}
@@ -48,7 +58,7 @@ func runEnroll(args []string, stdout, stderr io.Writer) int {
 		return fail("%v", err)
 	}
 
-	cfg, err := config.Load(*path, config.DetectPlatform("/"))
+	cfg, err := config.Load(*path, detectPlatform())
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fail("%v", err)
 	}
@@ -68,12 +78,6 @@ func runEnroll(args []string, stdout, stderr io.Writer) int {
 			return fail("already enrolled as %s; pass --force to re-enroll", creds.ServerUUID)
 		case !errors.Is(err, fs.ErrNotExist):
 			return fail("credentials in %s are unreadable (%v); pass --force to re-enroll", cfg.StateDir, err)
-		}
-	}
-
-	if setURL {
-		if err := config.SetPlatformURL(*path, target.BaseURL()); err != nil {
-			return fail("%v", err)
 		}
 	}
 
@@ -115,6 +119,22 @@ func runEnroll(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail("enrolled as %s but cannot save the credentials: %v", resp.ServerUUID, err)
 	}
+	// platform_url changes last, and only after the platform accepted the
+	// token: a failed enroll must never leave the old credentials pointed at
+	// a new platform. If this write fails, the new credentials are removed so
+	// that they are not sent to the old platform either.
+	if setURL {
+		if err := config.SetPlatformURL(*path, target.BaseURL()); err != nil {
+			_ = store.RemoveCredentials()
+			return fail("enrolled as %s but cannot save platform_url (credentials removed; enroll again with a new token): %v", resp.ServerUUID, err)
+		}
+	}
 	_, _ = fmt.Fprintf(stdout, "enrolled as %s\n", resp.ServerUUID)
+	if cfg.Platform == config.PlatformSystemd {
+		// A running agent keeps the identity it started with. install.sh
+		// drops this line and restarts the service itself, as the Unraid
+		// enroll wrapper does on Unraid.
+		_, _ = fmt.Fprintln(stdout, "restart lookout (systemctl restart lookout) to apply")
+	}
 	return 0
 }

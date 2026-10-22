@@ -49,6 +49,8 @@ func TestRunVersionRejectsExtraArgs(t *testing.T) {
 	}
 }
 
+// A positional argument may be a misplaced secret (such as the enrollment
+// token), and stderr ends up in syslog: it is never echoed.
 func TestRunRejectsPositionalArgs(t *testing.T) {
 	env := newTestEnv(t, "https://media.example.com")
 	tests := []struct {
@@ -59,12 +61,16 @@ func TestRunRejectsPositionalArgs(t *testing.T) {
 		{"run", []string{"run", "--config", env.config, "foo"}},
 		{"check-config", []string{"check-config", "--config", env.config, "foo"}},
 		{"enroll", []string{"enroll", "--config", env.config, "--url", "https://x.example", "--token", enrollToken, "foo"}},
+		{"enroll with the token as an argument", []string{"enroll", "--config", env.config, "--url", "https://x.example", "--token", "x", "foo"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			code, stdout, stderr := runCLI(tt.args...)
-			if code != 2 || stdout != "" || !strings.Contains(stderr, `unexpected argument "foo"`) {
+			if code != 2 || stdout != "" || !strings.Contains(stderr, "takes no positional arguments") {
 				t.Fatalf("exit code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+			if strings.Contains(stderr, "foo") {
+				t.Errorf("stderr echoes the argument: %q", stderr)
 			}
 		})
 	}

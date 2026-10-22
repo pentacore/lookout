@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -202,5 +204,35 @@ func TestRunAgentSkipsUpdaterWhenAutoUpdateOff(t *testing.T) {
 	case <-called:
 		t.Error("updater ran with auto_update: false")
 	default:
+	}
+}
+
+// run leaves its working directory for / so that it never keeps a disk or
+// the flash drive busy; a relative --config is resolved first.
+func TestLeaveWorkingDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	got, err := leaveWorkingDir("lookout.yaml")
+	if err != nil {
+		t.Fatalf("leaveWorkingDir: %v", err)
+	}
+	if filepath.Base(got) != "lookout.yaml" || !filepath.IsAbs(got) {
+		t.Fatalf("config path = %q, want an absolute path to lookout.yaml", got)
+	}
+	gotDir, err := os.Stat(filepath.Dir(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(gotDir, wantDir) {
+		t.Fatalf("config path = %q, want it under %q", got, dir)
+	}
+	cwd, err := os.Getwd()
+	if err != nil || cwd != "/" {
+		t.Fatalf("working dir = %q, %v; want /", cwd, err)
 	}
 }
