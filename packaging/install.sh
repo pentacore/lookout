@@ -1,10 +1,13 @@
 #!/bin/sh
 # Install or upgrade the lookout host agent on Debian/Ubuntu (systemd).
 #
-#   sudo sh install.sh --url https://media.example.com --token TOKEN [--version X.Y.Z]
+#   sh install.sh --url https://media.example.com [--version X.Y.Z]   (as root,
+#   with the enrollment token in LOOKOUT_TOKEN; or pass --token TOKEN)
 #
 # Safe to re-run: it upgrades the binary, keeps the existing config and, when
-# --token is given, re-enrolls the server. The enrollment token is never printed.
+# a token is given, re-enrolls the server. The enrollment token is never
+# printed and is handed to `lookout enroll` in its environment, not on its
+# command line.
 set -eu
 
 VERSION='@VERSION@'
@@ -21,7 +24,8 @@ usage() {
 usage: install.sh [--url PLATFORM_URL] [--token ENROLLMENT_TOKEN] [--version VERSION|latest]
 
   --url      platform base URL; required on first install
-  --token    enrollment token; required until this server is enrolled
+  --token    enrollment token; required until this server is enrolled. Prefer
+             setting LOOKOUT_TOKEN instead: sudo logs every command line.
   --version  release to install (default: the version this script was built for)
 USAGE
 }
@@ -122,9 +126,17 @@ WantedBy=multi-user.target
 UNIT
 }
 
+# enroll_server [--force] runs `lookout enroll` with the token in LOOKOUT_TOKEN,
+# so it never shows in the process list. This script restarts the service
+# itself, so the agent's "restart lookout" hint is dropped.
+enroll_server() {
+	es_out=$(LOOKOUT_TOKEN="$token" "$BIN_PATH" enroll --config "$CONFIG_PATH" --url "$platform_url" "$@") || exit 1
+	printf '%s\n' "$es_out" | sed '/^restart lookout /d'
+}
+
 main() {
 	platform_url=''
-	token=''
+	token="${LOOKOUT_TOKEN:-}"
 	version="$VERSION"
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
@@ -161,7 +173,7 @@ main() {
 	fi
 	if [ ! -f "$CONFIG_PATH" ]; then
 		[ -n "$platform_url" ] || die "--url is required on first install"
-		[ -n "$token" ] || die "--token is required (this server is not enrolled yet)"
+		[ -n "$token" ] || die "--token or LOOKOUT_TOKEN is required (this server is not enrolled yet)"
 	fi
 
 	arch=$(detect_arch) || exit 1
@@ -223,14 +235,14 @@ main() {
 	fi
 
 	if [ -z "$token" ]; then
-		[ "$enrolled" = no ] || [ "$switching" = no ] || die "--url changes the platform; pass --token to re-enroll"
-		[ "$enrolled" = yes ] || die "--token is required (this server is not enrolled yet)"
+		[ "$enrolled" = no ] || [ "$switching" = no ] || die "--url changes the platform; pass --token or LOOKOUT_TOKEN to re-enroll"
+		[ "$enrolled" = yes ] || die "--token or LOOKOUT_TOKEN is required (this server is not enrolled yet)"
 	else
 		[ -n "$platform_url" ] || die "no platform_url in $CONFIG_PATH; pass --url"
 		if [ "$enrolled" = yes ] || [ "$switching" = yes ]; then
-			"$BIN_PATH" enroll --config "$CONFIG_PATH" --url "$platform_url" --token "$token" --force
+			enroll_server --force
 		else
-			"$BIN_PATH" enroll --config "$CONFIG_PATH" --url "$platform_url" --token "$token"
+			enroll_server
 		fi
 	fi
 

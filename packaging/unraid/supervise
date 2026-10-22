@@ -2,20 +2,27 @@
 # Keeps `lookout run` alive on Unraid, which has no service manager: restarts
 # the agent LOOKOUT_RESTART_DELAY seconds after it exits and sends its output
 # to syslog (tag lookout). TERM or INT stops the agent and then this loop.
-LOOKOUT_BIN="${LOOKOUT_BIN:-/usr/local/bin/lookout}"
-LOOKOUT_CONFIG="${LOOKOUT_CONFIG:-/boot/config/plugins/lookout/lookout.yaml}"
-LOOKOUT_RESTART_DELAY="${LOOKOUT_RESTART_DELAY:-5}"
+#
+# bash reads a script as it runs it, and a plugin update rewrites this file in
+# place while it runs. The body is one function that bash parses whole before
+# the last line calls it and exits, so nothing written later is ever executed.
+main() {
+	LOOKOUT_BIN="${LOOKOUT_BIN:-/usr/local/bin/lookout}"
+	LOOKOUT_CONFIG="${LOOKOUT_CONFIG:-/boot/config/plugins/lookout/lookout.yaml}"
+	LOOKOUT_RESTART_DELAY="${LOOKOUT_RESTART_DELAY:-5}"
 
-stop=0
-child=
-trap 'stop=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT
-while [ "$stop" -eq 0 ]; do
-	"$LOOKOUT_BIN" run --config "$LOOKOUT_CONFIG" > >(logger -t lookout) 2>&1 &
-	child=$!
-	wait "$child"
-	[ "$stop" -eq 1 ] && wait "$child" 2>/dev/null
+	stop=0
 	child=
-	[ "$stop" -eq 1 ] && break
-	sleep "$LOOKOUT_RESTART_DELAY" &
-	wait $!
-done
+	trap 'stop=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT
+	while [ "$stop" -eq 0 ]; do
+		"$LOOKOUT_BIN" run --config "$LOOKOUT_CONFIG" > >(logger -t lookout) 2>&1 &
+		child=$!
+		wait "$child"
+		[ "$stop" -eq 1 ] && wait "$child" 2>/dev/null
+		child=
+		[ "$stop" -eq 1 ] && break
+		sleep "$LOOKOUT_RESTART_DELAY" &
+		wait $!
+	done
+}
+main "$@"; exit

@@ -41,13 +41,14 @@ wait_file() {
 	return 1
 }
 
-# start_supervise FAKE_BIN starts the supervisor detached from this shell (so
-# init reaps it and kill -0 is a reliable liveness check) and sets $sup.
+# start_supervise FAKE_BIN [SCRIPT] starts the supervisor (default: the one in
+# packaging/unraid) detached from this shell (so init reaps it and kill -0 is
+# a reliable liveness check) and sets $sup.
 start_supervise() {
 	rm -f "$work/sup.pid"
 	(
 		LOOKOUT_BIN="$1" LOOKOUT_CONFIG="$work/lookout.yaml" LOOKOUT_RESTART_DELAY=1 \
-			bash "$supervise" >/dev/null 2>&1 &
+			bash "${2:-$supervise}" >/dev/null 2>&1 &
 		echo $! >"$work/sup.pid"
 	)
 	sup=$(cat "$work/sup.pid")
@@ -84,5 +85,23 @@ kill -TERM "$sup"
 wait_gone "$sup" 2 || fail "supervisor with a running child still running 2s after TERM"
 sup=''
 wait_gone "$fake" 2 || fail "child $fake orphaned after the supervisor stopped"
+
+# A plugin update rewrites the script in place while it runs. bash reads a
+# script as it goes, so the running supervisor must never execute what the
+# new file holds past the old one's end.
+cp "$supervise" "$work/supervise-copy"
+rm -f "$work/runs"
+start_supervise "$work/exits" "$work/supervise-copy"
+sleep 1.5
+size=$(wc -c <"$work/supervise-copy" | tr -d ' ')
+{
+	head -c "$((size - 1))" /dev/zero | tr '\0' '#'
+	printf '\n'
+	printf 'touch "%s"\n' "$work/fragment-ran"
+} >"$work/supervise-copy"
+kill -TERM "$sup"
+wait_gone "$sup" 2 || fail "updated supervisor still running 2s after TERM"
+sup=''
+[ ! -e "$work/fragment-ran" ] || fail "supervisor ran a fragment of the rewritten script"
 
 echo "supervise_test: ok"

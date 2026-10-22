@@ -184,6 +184,25 @@ LOOKOUT_PIDFILE="$pidfile" LOOKOUT_STOP_TIMEOUT=1 bash "$unraid/rc.lookout" stop
 wait_gone "$pid" 2 || fail "stop did not kill a supervisor that ignores TERM"
 [ ! -e "$pidfile" ] || fail "forced stop left the pidfile"
 
+# The supervisor runs from /, never from the caller's directory, so it does
+# not keep a disk or the flash drive busy.
+cat >"$fx/pwd-supervise" <<'FAKE'
+#!/bin/sh
+pwd >"$FAKE_LOG/sup-cwd"
+exec sleep 100
+FAKE
+chmod +x "$fx/pwd-supervise"
+mkdir -p "$work/somewhere"
+(cd "$work/somewhere" && FAKE_LOG="$fx/log" LOOKOUT_PIDFILE="$pidfile" LOOKOUT_SUPERVISE="$fx/pwd-supervise" \
+	bash "$unraid/rc.lookout" start >/dev/null 2>&1)
+cp "$pidfile" "$work/rc.pid"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	[ -s "$fx/log/sup-cwd" ] && break
+	sleep 0.1
+done
+assert_eq "supervisor working directory" / "$(cat "$fx/log/sup-cwd" 2>/dev/null)"
+LOOKOUT_PIDFILE="$pidfile" bash "$unraid/rc.lookout" stop >/dev/null 2>&1
+
 # --- render ---------------------------------------------------------------
 
 MINISIGN_PUBLIC_KEY=RWQtest "$root/scripts/render-release-files.sh" 0.2.0 "$work/out" || fail "render failed"
@@ -344,6 +363,17 @@ new_root "$d"
 run_install "$d" FAKE_CURL_FAIL=1
 assert_eq "install offline without binary status" 1 "$rc"
 [ ! -e "$d/log/rc" ] || fail "install offline without binary started the agent"
+
+# A default config that cannot be written stops the install before the agent
+# is started without one.
+d="$work/noconfig"
+new_root "$d"
+persisted "$d" 0.2.0
+ln -s "$d/missing-dir/lookout.yaml" "$d/boot/config/plugins/lookout/lookout.yaml"
+run_install "$d"
+assert_eq "install unwritable config status ($out)" 1 "$rc"
+assert_contains "install unwritable config message" "lookout: cannot write" "$out"
+[ ! -e "$d/log/rc" ] || fail "install with an unwritable config started the agent"
 
 d="$work/remove"
 new_root "$d"

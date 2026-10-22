@@ -22,8 +22,10 @@ start() {
 		echo "lookout is already running (pid $pid)"
 		return 0
 	fi
-	# setsid detaches the supervisor from the caller (the webGUI or the plugin
+	# The supervisor must not keep the caller's directory (a disk or the flash
+	# drive) busy. setsid detaches it from the caller (the webGUI or the plugin
 	# manager). macOS has no setsid; plain nohup keeps the local tests working.
+	cd / || exit 1
 	if command -v setsid >/dev/null 2>&1; then
 		setsid nohup "$SUPERVISE" >/dev/null 2>&1 &
 	else

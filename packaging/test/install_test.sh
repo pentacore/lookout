@@ -106,8 +106,10 @@ check-config)
 	if [ -f "$LOOKOUT_DESTDIR/enrolled" ]; then echo "enrolled:     yes (server abc)"; else echo "enrolled:     no"; fi
 	;;
 enroll)
-	echo "enroll $*" >>"$LOOKOUT_DESTDIR/calls"
+	echo "enroll $* token=${LOOKOUT_TOKEN:-}" >>"$LOOKOUT_DESTDIR/calls"
 	: >"$LOOKOUT_DESTDIR/enrolled"
+	echo "enrolled as abc"
+	echo "restart lookout (systemctl restart lookout) to apply"
 	;;
 esac
 FAKE
@@ -190,8 +192,11 @@ assert_not_contains "run1 no sha256 warning" "minisign not installed" "$(cat "$w
 assert_eq "run1 config" "platform_url: https://media.example.com
 state_dir: /var/lib/lookout
 auto_update: true" "$(cat "$work/run1/root/etc/lookout/lookout.yaml")"
-assert_contains "run1 enroll args" "--url https://media.example.com --token SECRET-TOKEN" "$(cat "$work/run1/root/calls")"
+assert_contains "run1 enroll args" "--url https://media.example.com token=SECRET-TOKEN" "$(cat "$work/run1/root/calls")"
+assert_not_contains "run1 token not on the enroll command line" "--token" "$(cat "$work/run1/root/calls")"
 assert_not_contains "run1 enroll without force" "--force" "$(cat "$work/run1/root/calls")"
+assert_contains "run1 enroll output" "enrolled as abc" "$(cat "$work/run1/stdout")"
+assert_not_contains "run1 restart hint dropped" "restart lookout (" "$(cat "$work/run1/stdout")"
 assert_not_contains "run1 token not echoed (stdout)" SECRET-TOKEN "$(cat "$work/run1/stdout")"
 assert_not_contains "run1 token not echoed (stderr)" SECRET-TOKEN "$(cat "$work/run1/stderr")"
 assert_eq "run1 systemctl" "daemon-reload
@@ -246,7 +251,7 @@ restart lookout" "$(cat "$work/run5/systemctl")"
 		sh "$work/out/install.sh" --token T2
 ) >/dev/null 2>&1
 assert_eq "run6 status" 0 $?
-assert_contains "run6 force and config url" "--url https://media.example.com --token T2 --force" "$(cat "$work/rerun-root/calls")"
+assert_contains "run6 force and config url" "--url https://media.example.com --force token=T2" "$(cat "$work/rerun-root/calls")"
 
 # A different --url on an enrolled host without --token is refused: the old
 # credentials must not be sent to another platform. Nothing changes.
@@ -255,7 +260,7 @@ rm -f "$work/switch-root/calls"
 if run_install_root "$work/run11" "$work/switch-root" --url https://other.example.com; then
 	fail "run11 must refuse to switch platform without --token"
 fi
-assert_contains "run11 message" "--url changes the platform; pass --token to re-enroll" "$(cat "$work/run11/stderr")"
+assert_contains "run11 message" "--url changes the platform; pass --token or LOOKOUT_TOKEN to re-enroll" "$(cat "$work/run11/stderr")"
 assert_eq "run11 config unchanged" "$(cat "$work/run1/root/etc/lookout/lookout.yaml")" "$(cat "$work/switch-root/etc/lookout/lookout.yaml")"
 [ ! -e "$work/switch-root/calls" ] || fail "run11 must not call enroll"
 assert_eq "run11 no systemctl" "" "$(cat "$work/run11/systemctl")"
@@ -263,7 +268,7 @@ assert_eq "run11 no systemctl" "" "$(cat "$work/run11/systemctl")"
 # With --token the switch re-enrolls with --force; install.sh leaves the config to enroll.
 run_install_root "$work/run12" "$work/switch-root" --url https://other.example.com --token T3
 assert_eq "run12 status" 0 $?
-assert_contains "run12 enroll" "--url https://other.example.com --token T3 --force" "$(cat "$work/switch-root/calls")"
+assert_contains "run12 enroll" "--url https://other.example.com --force token=T3" "$(cat "$work/switch-root/calls")"
 assert_eq "run12 config left to enroll" "$(cat "$work/run1/root/etc/lookout/lookout.yaml")" "$(cat "$work/switch-root/etc/lookout/lookout.yaml")"
 
 # A trailing slash is the same platform, not a switch.
@@ -303,7 +308,19 @@ assert_contains "run7 message" "--url is required on first install" "$(cat "$wor
 if run_install "$work/run8" "$withminisign" --url https://media.example.com; then
 	fail "run8 must fail without --token"
 fi
-assert_contains "run8 message" "--token is required (this server is not enrolled yet)" "$(cat "$work/run8/stderr")"
+assert_contains "run8 message" "--token or LOOKOUT_TOKEN is required (this server is not enrolled yet)" "$(cat "$work/run8/stderr")"
+
+# The token can come from LOOKOUT_TOKEN instead of the command line, which
+# sudo would log; --token wins when both are given.
+if ! (LOOKOUT_TOKEN=ENV-TOKEN && export LOOKOUT_TOKEN && run_install "$work/run17" "$withminisign" --url https://media.example.com); then
+	fail "run17 must enroll with LOOKOUT_TOKEN: $(cat "$work/run17/stderr")"
+fi
+assert_contains "run17 env token" "token=ENV-TOKEN" "$(cat "$work/run17/root/calls")"
+assert_not_contains "run17 token not echoed (stdout)" ENV-TOKEN "$(cat "$work/run17/stdout")"
+assert_not_contains "run17 token not echoed (stderr)" ENV-TOKEN "$(cat "$work/run17/stderr")"
+(LOOKOUT_TOKEN=ENV-TOKEN && export LOOKOUT_TOKEN && run_install "$work/run18" "$withminisign" --url https://media.example.com --token FLAG-TOKEN) ||
+	fail "run18 failed: $(cat "$work/run18/stderr")"
+assert_contains "run18 flag wins" "token=FLAG-TOKEN" "$(cat "$work/run18/root/calls")"
 
 # Unknown flags print usage and exit 2 without echoing the argument.
 run_install "$work/run9" "$withminisign" --bogus SECRET-TOKEN

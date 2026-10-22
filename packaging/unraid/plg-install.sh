@@ -110,7 +110,10 @@ if [ -z "$installed" ] ||
 fi
 
 if [ ! -f "$PLGDIR/lookout.yaml" ]; then
-	printf 'platform_url: ""\nstate_dir: /boot/config/plugins/lookout/state\nruntime_dir: /run/lookout\nauto_update: true\n' >"$PLGDIR/lookout.yaml"
+	printf 'platform_url: ""\nstate_dir: /boot/config/plugins/lookout/state\nruntime_dir: /run/lookout\nauto_update: true\n' >"$PLGDIR/lookout.yaml" || {
+		echo "lookout: cannot write $PLGDIR/lookout.yaml"
+		exit 1
+	}
 fi
 
 "$RC" restart
