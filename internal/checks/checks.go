@@ -68,6 +68,7 @@ func DefaultRegistry() Registry {
 		"mount_present":  mountPresent,
 		"path_on_mount":  pathOnMount,
 		"file_freshness": fileFreshness,
+		"db_ping":        dbPing,
 	}
 }
 
