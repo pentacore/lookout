@@ -48,3 +48,24 @@ func TestRunVersionRejectsExtraArgs(t *testing.T) {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
 }
+
+func TestRunRejectsPositionalArgs(t *testing.T) {
+	env := newTestEnv(t, "https://media.example.com")
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"version", []string{"version", "foo"}},
+		{"run", []string{"run", "--config", env.config, "foo"}},
+		{"check-config", []string{"check-config", "--config", env.config, "foo"}},
+		{"enroll", []string{"enroll", "--config", env.config, "--url", "https://x.example", "--token", enrollToken, "foo"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, stdout, stderr := runCLI(tt.args...)
+			if code != 2 || stdout != "" || !strings.Contains(stderr, `unexpected argument "foo"`) {
+				t.Fatalf("exit code = %d, stdout = %q, stderr = %q", code, stdout, stderr)
+			}
+		})
+	}
+}

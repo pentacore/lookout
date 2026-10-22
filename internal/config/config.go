@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/pentacore/lookout/internal/state"
 )
 
 // Platform is the kind of host the agent runs on. It selects default paths.
@@ -167,8 +169,19 @@ func (c Config) BaseURL() string {
 
 // SetPlatformURL writes platform_url into the config at path. A missing file
 // is created containing only that key; otherwise the value is edited through
-// a yaml.Node round trip so other keys and comments survive.
+// a yaml.Node round trip so other keys and comments survive. The file is
+// replaced atomically (the Unraid config lives on a USB flash drive). When
+// path is a symlink the file it points to is edited and the link kept; an
+// existing file keeps its permissions and a new one gets 0644.
 func SetPlatformURL(path, platformURL string) error {
+	perm := fs.FileMode(0o644)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+		if info, err := os.Stat(path); err == nil {
+			perm = info.Mode().Perm()
+		}
+	}
+
 	doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode}}}
 
 	data, err := os.ReadFile(path)
@@ -199,7 +212,7 @@ func SetPlatformURL(path, platformURL string) error {
 	if err != nil {
 		return fmt.Errorf("encode config: %w", err)
 	}
-	if err := os.WriteFile(path, out, 0o644); err != nil {
+	if err := state.WriteFileAtomic(path, out, perm); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 	return nil

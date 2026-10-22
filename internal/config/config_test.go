@@ -253,3 +253,37 @@ func TestSetPlatformURL(t *testing.T) {
 		}
 	})
 }
+
+func TestSetPlatformURLKeepsSymlinkAndLeavesNoTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.yaml")
+	link := filepath.Join(dir, "lookout.yaml")
+	if err := os.WriteFile(target, []byte("state_dir: /x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real.yaml", link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if err := SetPlatformURL(link, "https://e"); err != nil {
+		t.Fatal(err)
+	}
+
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link was replaced: %v, %v", info, err)
+	}
+	cfg, err := Load(target, PlatformSystemd)
+	if err != nil || cfg.PlatformURL != "https://e" || cfg.StateDir != "/x" {
+		t.Errorf("reload target = %+v, %v", cfg, err)
+	}
+	if info, err := os.Stat(target); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("target mode = %v, %v; want the existing 0600 kept", info, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("directory has %d entries, want only the file and its link", len(entries))
+	}
+}

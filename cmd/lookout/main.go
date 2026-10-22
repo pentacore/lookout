@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/pentacore/lookout/internal/config"
 )
 
 const usage = "usage: lookout <run|enroll|version|check-config>"
@@ -22,6 +24,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	switch args[0] {
+	case "run":
+		return runService(args[1:], stderr)
+	case "enroll":
+		return runEnroll(args[1:], stdout, stderr)
+	case "check-config":
+		return runCheckConfig(args[1:], stdout, stderr)
 	case "version":
 		return runVersion(args[1:], stdout, stderr)
 	default:
@@ -30,8 +38,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-// parseFlags parses args with fs and maps the outcome to an exit code. ok is
-// false when the caller should return code immediately.
+// parseFlags parses args with fs and maps the outcome to an exit code. No
+// subcommand takes positional arguments, so any are a usage error. ok is false
+// when the caller should return code immediately.
 func parseFlags(fs *flag.FlagSet, args []string) (code int, ok bool) {
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -39,7 +48,16 @@ func parseFlags(fs *flag.FlagSet, args []string) (code int, ok bool) {
 		}
 		return 2, false
 	}
+	if fs.NArg() > 0 {
+		_, _ = fmt.Fprintf(fs.Output(), "lookout %s: unexpected argument %q\n", fs.Name(), fs.Arg(0))
+		return 2, false
+	}
 	return 0, true
+}
+
+// defaultConfigPath is the config location for the platform this host runs.
+func defaultConfigPath() string {
+	return config.DefaultPath(config.DetectPlatform("/"))
 }
 
 // newFlagSet returns a flag set that reports errors on stderr instead of exiting.
