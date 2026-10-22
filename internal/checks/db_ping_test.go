@@ -3,11 +3,20 @@ package checks
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -437,6 +446,10 @@ func TestDBPingTimeout(t *testing.T) {
 				t.Errorf("status = %q (%s), want crit", got.Status, got.Message)
 			}
 
+			if !strings.HasSuffix(got.Message, "timed out after 1s") {
+				t.Errorf("message = %q, want it to end with %q", got.Message, "timed out after 1s")
+			}
+
 			if got.Observed == nil {
 				t.Error("observed is nil, want a non-nil map")
 			}
@@ -461,6 +474,10 @@ func TestDBPingCancelledContext(t *testing.T) {
 
 	if got.Status != wire.StatusCrit {
 		t.Errorf("status = %q (%s), want crit", got.Status, got.Message)
+	}
+
+	if !strings.HasSuffix(got.Message, "cancelled") {
+		t.Errorf("message = %q, want it to end with %q", got.Message, "cancelled")
 	}
 }
 
@@ -542,5 +559,162 @@ func TestEffectiveTimeout(t *testing.T) {
 func TestDefaultRegistryHasDBPing(t *testing.T) {
 	if DefaultRegistry()["db_ping"] == nil {
 		t.Error(`DefaultRegistry has no "db_ping"`)
+	}
+}
+
+// TestMySQLLatencyExcludesLogin asserts that work after the deciding response does not
+// count as latency: the fake stalls the follow-up exchange for two seconds.
+func TestMySQLLatencyExcludesLogin(t *testing.T) {
+	server := startFakeServer(t, func(conn net.Conn) {
+		_, _ = conn.Write(mysqlGreeting("8.0.36"))
+
+		if _, _, ok := serverReadPacket(t, conn); !ok {
+			return
+		}
+
+		time.Sleep(2 * time.Second)
+
+		_, _ = conn.Write(mysqlERR(2, 1045, "denied"))
+
+		expectQuit(t, conn)
+	})
+
+	got := runCheck(dbPing, dialEnv(), server.params("mysql"))
+	server.wait(t)
+
+	if got.Status != wire.StatusOK {
+		t.Fatalf("status = %q (%s), want ok", got.Status, got.Message)
+	}
+
+	assertLatency(t, got)
+
+	if latency := got.Observed["latency_ms"].(float64); latency > 500 {
+		t.Errorf("latency_ms = %v, want the greeting time, not the 2s login stall", latency)
+	}
+}
+
+func selfSignedCert(t *testing.T) tls.Certificate {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "lookout-test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// recordingConn keeps every byte read from the client.
+type recordingConn struct {
+	net.Conn
+	read bytes.Buffer
+}
+
+func (c *recordingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.read.Write(p[:n])
+
+	return n, err
+}
+
+// lastTLSRecordType returns the content type of the final TLS record in data.
+func lastTLSRecordType(t *testing.T, data []byte) byte {
+	t.Helper()
+
+	var last byte
+
+	for len(data) > 0 {
+		if len(data) < 5 {
+			t.Fatalf("truncated TLS record header in % x", data)
+		}
+
+		length := int(binary.BigEndian.Uint16(data[3:5]))
+		if len(data) < 5+length {
+			t.Fatalf("truncated TLS record body (%d of %d bytes)", len(data)-5, length)
+		}
+
+		last = data[0]
+		data = data[5+length:]
+	}
+
+	return last
+}
+
+// The server is pinned to TLS 1.2 because only there is the alert record type
+// visible on the wire; a TLS 1.3 close_notify looks like application data.
+func TestPostgresTLSIsClosedWithCloseNotify(t *testing.T) {
+	cert := selfSignedCert(t)
+	recorded := make(chan *recordingConn, 1)
+
+	server := startFakeServer(t, func(conn net.Conn) {
+		if _, err := io.ReadFull(conn, make([]byte, 8)); err != nil {
+			t.Errorf("read SSLRequest: %v", err)
+
+			return
+		}
+
+		_, _ = conn.Write([]byte("S"))
+
+		recording := &recordingConn{Conn: conn}
+		secured := tls.Server(recording, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+			MaxVersion:   tls.VersionTLS12,
+		})
+
+		if err := secured.Handshake(); err != nil {
+			t.Errorf("server handshake: %v", err)
+
+			return
+		}
+
+		if _, err := secured.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Errorf("server read after handshake = %v, want io.EOF", err)
+		}
+
+		recorded <- recording
+	})
+
+	got := runCheck(dbPing, dialEnv(), server.params("postgres"))
+	server.wait(t)
+
+	if got.Status != wire.StatusOK {
+		t.Fatalf("status = %q (%s), want ok", got.Status, got.Message)
+	}
+
+	select {
+	case recording := <-recorded:
+		if typ := lastTLSRecordType(t, recording.read.Bytes()); typ != 0x15 {
+			t.Errorf("last TLS record from client has type %#x, want alert 0x15 (close_notify)", typ)
+		}
+	default:
+		t.Error("server never finished reading")
+	}
+}
+
+func TestPrintableServerText(t *testing.T) {
+	tests := []struct{ name, in, want string }{
+		{"plain", "8.0.36", "8.0.36"},
+		{"control characters", "bad\r\nline\x07\x1b[31m", "bad  line  [31m"},
+		{"invalid utf8", "a\xffb", "a?b"},
+		{"truncated", strings.Repeat("x", 500), strings.Repeat("x", 200)},
+	}
+
+	for _, tt := range tests {
+		if got := printableServerText(tt.in); got != tt.want {
+			t.Errorf("%s: printableServerText(%q) = %q, want %q", tt.name, tt.in, got, tt.want)
+		}
 	}
 }

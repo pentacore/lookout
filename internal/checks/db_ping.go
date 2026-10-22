@@ -11,9 +11,11 @@ import (
 	"io"
 	"math"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/pentacore/lookout/internal/wire"
 )
@@ -74,7 +76,7 @@ func dbPing(ctx context.Context, env Env, raw json.RawMessage) Outcome {
 		return withObserved(missingParam("port"))
 	}
 
-	var exchange func(ctx context.Context, conn net.Conn) (wire.CheckStatus, string)
+	var exchange func(session dbSession) pingResult
 
 	switch params.Engine {
 	case "postgres":
@@ -88,16 +90,22 @@ func dbPing(ctx context.Context, env Env, raw json.RawMessage) Outcome {
 		})
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, effectiveTimeout(params.TimeoutSeconds))
+	timeout := effectiveTimeout(params.TimeoutSeconds)
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	addr := net.JoinHostPort(params.Host, strconv.Itoa(params.Port))
 	start := time.Now()
 
+	session := dbSession{ctx: ctx, timeout: timeout}
+
 	conn, err := env.Dial(ctx, "tcp", addr)
 	if err != nil {
-		return pingOutcome(start, wire.StatusCrit, fmt.Sprintf("cannot connect to %s: %v", addr, err))
+		return pingOutcome(start, session.failure("cannot connect to "+addr, err))
 	}
+
+	session.conn = conn
 
 	defer func() { _ = conn.Close() }()
 
@@ -110,9 +118,40 @@ func dbPing(ctx context.Context, env Env, raw json.RawMessage) Outcome {
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
-	status, message := exchange(ctx, conn)
+	return pingOutcome(start, exchange(session))
+}
 
-	return pingOutcome(start, status, message)
+// dbSession is one open connection plus the deadline it runs under.
+type dbSession struct {
+	ctx     context.Context
+	conn    net.Conn
+	timeout time.Duration
+}
+
+// pingResult is a decided status. decidedAt is when the deciding response
+// arrived, so work done afterwards (logins, TLS, quit) does not count as
+// latency.
+type pingResult struct {
+	status    wire.CheckStatus
+	message   string
+	decidedAt time.Time
+}
+
+func decided(status wire.CheckStatus, message string) pingResult {
+	return pingResult{status: status, message: message, decidedAt: time.Now()}
+}
+
+// failure is a crit result for an I/O error. Deadline expiry and caller
+// cancellation get one stable message instead of a platform-specific i/o text.
+func (s dbSession) failure(what string, err error) pingResult {
+	switch {
+	case errors.Is(s.ctx.Err(), context.DeadlineExceeded), errors.Is(err, os.ErrDeadlineExceeded):
+		return decided(wire.StatusCrit, fmt.Sprintf("%s: timed out after %gs", what, s.timeout.Seconds()))
+	case errors.Is(s.ctx.Err(), context.Canceled):
+		return decided(wire.StatusCrit, what+": cancelled")
+	default:
+		return decided(wire.StatusCrit, fmt.Sprintf("%s: %v", what, err))
+	}
 }
 
 func withObserved(outcome Outcome) Outcome {
@@ -121,80 +160,86 @@ func withObserved(outcome Outcome) Outcome {
 	return outcome
 }
 
-// pingOutcome stamps the time since start, rounded to 0.1 ms, onto an outcome.
-func pingOutcome(start time.Time, status wire.CheckStatus, message string) Outcome {
-	latency := math.Round(float64(time.Since(start).Microseconds())/100) / 10
+// pingOutcome turns a result into an Outcome whose latency_ms runs from start
+// to the deciding response, rounded to 0.1 ms.
+func pingOutcome(start time.Time, result pingResult) Outcome {
+	latency := math.Round(float64(result.decidedAt.Sub(start).Microseconds())/100) / 10
 
 	return Outcome{
-		Status:   status,
-		Message:  message,
+		Status:   result.status,
+		Message:  result.message,
 		Observed: map[string]any{"latency_ms": latency},
 	}
 }
 
 // postgresExchange sends an SSLRequest and reads the one-byte answer.
-func postgresExchange(ctx context.Context, conn net.Conn) (wire.CheckStatus, string) {
-	if _, err := conn.Write(postgresSSLRequest); err != nil {
-		return wire.StatusCrit, fmt.Sprintf("cannot send SSLRequest: %v", err)
+func postgresExchange(session dbSession) pingResult {
+	if _, err := session.conn.Write(postgresSSLRequest); err != nil {
+		return session.failure("cannot send SSLRequest", err)
 	}
 
 	answer := make([]byte, 1)
-	if _, err := io.ReadFull(conn, answer); err != nil {
-		return wire.StatusCrit, fmt.Sprintf("no answer to SSLRequest: %v", err)
+	if _, err := io.ReadFull(session.conn, answer); err != nil {
+		return session.failure("no answer to SSLRequest", err)
 	}
 
 	switch answer[0] {
 	case 'N':
-		return wire.StatusOK, "postgres answered: SSL not offered"
+		return decided(wire.StatusOK, "postgres answered: SSL not offered")
 	case 'S':
-		finishPostgresTLS(ctx, conn)
+		result := decided(wire.StatusOK, "postgres answered: SSL offered")
 
-		return wire.StatusOK, "postgres answered: SSL offered"
+		finishPostgresTLS(session)
+
+		return result
 	default:
-		return wire.StatusCrit, fmt.Sprintf("unexpected response 0x%02x to SSLRequest", answer[0])
+		return decided(wire.StatusCrit, fmt.Sprintf("unexpected response 0x%02x to SSLRequest", answer[0]))
 	}
 }
 
-// finishPostgresTLS runs a best-effort TLS handshake so a TLS-enabled server
-// sees a clean connection instead of logging "could not accept SSL
-// connection" on every check. Certificate verification is skipped on purpose:
-// no data is ever sent over this connection, so there is nothing for a forged
-// certificate to intercept. Handshake failures are ignored.
-func finishPostgresTLS(ctx context.Context, conn net.Conn) {
-	client := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+// finishPostgresTLS runs a best-effort TLS handshake, then closes the TLS
+// session cleanly, so a TLS-enabled server sees an orderly shutdown instead of
+// logging "could not accept SSL connection" or "Connection reset by peer" on
+// every check. Certificate verification is skipped on purpose: no data is ever
+// sent over this connection, so there is nothing for a forged certificate to
+// intercept. Failures are ignored.
+func finishPostgresTLS(session dbSession) {
+	client := tls.Client(session.conn, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
 
-	_ = client.HandshakeContext(ctx)
+	if client.HandshakeContext(session.ctx) == nil {
+		_ = client.Close()
+	}
 }
 
 // mysqlExchange reads the server greeting, then logs in as a fixed
 // non-existent user and quits so the server does not count an aborted
 // connect against max_connect_errors.
-func mysqlExchange(_ context.Context, conn net.Conn) (wire.CheckStatus, string) {
-	seq, payload, err := readMySQLPacket(conn)
+func mysqlExchange(session dbSession) pingResult {
+	seq, payload, err := readMySQLPacket(session.conn)
 	if errors.Is(err, errOversizedPacket) {
-		return wire.StatusCrit, errOversizedPacket.Error()
+		return decided(wire.StatusCrit, errOversizedPacket.Error())
 	}
 
 	if err != nil {
-		return wire.StatusCrit, fmt.Sprintf("no mysql greeting: %v", err)
+		return session.failure("no mysql greeting", err)
 	}
 
 	if len(payload) == 0 {
-		return wire.StatusCrit, "empty mysql greeting"
+		return decided(wire.StatusCrit, "empty mysql greeting")
 	}
 
 	switch payload[0] {
 	case 0x0a:
 		version, _, _ := strings.Cut(string(payload[1:]), "\x00")
-		message := "mysql protocol 10, server " + printableServerText(version)
+		result := decided(wire.StatusOK, "mysql protocol 10, server "+printableServerText(version))
 
-		mysqlLoginAndQuit(conn, seq)
+		mysqlLoginAndQuit(session.conn, seq)
 
-		return wire.StatusOK, message
+		return result
 	case 0xff:
-		return wire.StatusOK, mysqlErrorMessage(payload)
+		return decided(wire.StatusOK, mysqlErrorMessage(payload))
 	default:
-		return wire.StatusCrit, fmt.Sprintf("unexpected mysql greeting 0x%02x", payload[0])
+		return decided(wire.StatusCrit, fmt.Sprintf("unexpected mysql greeting 0x%02x", payload[0]))
 	}
 }
 
@@ -209,13 +254,20 @@ func mysqlErrorMessage(payload []byte) string {
 	return fmt.Sprintf("mysql answered with error %d: %s", code, printableServerText(string(payload[3:])))
 }
 
-// printableServerText bounds and sanitises text the server sent.
+// printableServerText bounds and sanitises text the server sent: valid UTF-8
+// only, control characters replaced by spaces.
 func printableServerText(text string) string {
 	if len(text) > dbPingMaxServerText {
 		text = text[:dbPingMaxServerText]
 	}
 
-	return strings.ToValidUTF8(text, "?")
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+
+		return r
+	}, strings.ToValidUTF8(text, "?"))
 }
 
 // mysqlLoginAndQuit sends a HandshakeResponse41 for the user "lookout" with
