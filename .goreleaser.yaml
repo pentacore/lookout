@@ -53,5 +53,9 @@ release:
   # Published as a draft, which agents and install.sh can't see. The release
   # workflow verifies dist/ and then publishes the draft.
   draft: true
+  # A re-run of the workflow for the same tag replaces its earlier draft
+  # instead of adding a second one; the workflow checks there is exactly one
+  # before it publishes.
+  replace_existing_draft: true
   extra_files:
     - glob: ./build/release-extra/*
