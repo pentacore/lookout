@@ -21,11 +21,13 @@ const (
 	defaultDockerInspectTimeout = 5 * time.Second
 	dockerInspectConcurrency    = 4
 	dockerShortIDLength         = 12
+	dockerMaxResponseBytes      = 16 << 20
 )
 
 // DockerClient lists containers over the Docker unix socket using the
 // unversioned API. Zero timeouts default to 3 s for the list call and 5 s in
-// total for all inspect calls. It is safe for concurrent use.
+// total for all inspect calls, so one call takes at most ListTimeout +
+// InspectTimeout (8 s by default). It is safe for concurrent use.
 type DockerClient struct {
 	SocketPath     string
 	ListTimeout    time.Duration
@@ -62,7 +64,8 @@ type dockerInspect struct {
 // when the socket does not exist, and nil with an error when the list call
 // fails or times out. RestartCount and health come from a per-container
 // inspect; a failed inspect reuses the last known values for that container,
-// or 0 and no health if there are none.
+// or 0 and no health if there are none. A hung inspect therefore never
+// turns the result into an error; only the list call decides that.
 func (d *DockerClient) Containers(ctx context.Context) ([]wire.Container, error) {
 	if _, err := os.Stat(d.SocketPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -168,7 +171,7 @@ func (d *DockerClient) getJSON(ctx context.Context, path string, into any) error
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("docker API %s: %s", path, resp.Status)
 	}
-	return json.NewDecoder(resp.Body).Decode(into)
+	return json.NewDecoder(io.LimitReader(resp.Body, dockerMaxResponseBytes)).Decode(into)
 }
 
 // containerName is the first name without its leading slash, or the short ID

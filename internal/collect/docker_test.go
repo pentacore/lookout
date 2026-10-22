@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -212,5 +213,92 @@ func TestContainersNameFallsBackToShortID(t *testing.T) {
 	}
 	if len(containers) != 1 || containers[0].Name != "0123456789ab" {
 		t.Errorf("containers = %+v, want name 0123456789ab", containers)
+	}
+}
+
+// dockerHungInspectHandler answers the list call but never answers an inspect
+// until release is closed.
+func dockerHungInspectHandler(release <-chan struct{}) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/containers/json" {
+			_, _ = w.Write([]byte(dockerListBody))
+			return
+		}
+		<-release
+	})
+}
+
+func TestContainersHungInspectWithoutCache(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	socket := newDockerFake(t, dockerHungInspectHandler(release))
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	client := &DockerClient{SocketPath: socket, ListTimeout: time.Second, InspectTimeout: 100 * time.Millisecond}
+
+	start := time.Now()
+	containers, err := client.Containers(context.Background())
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Errorf("Containers took %v, want well within ListTimeout+InspectTimeout", elapsed)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContainers(t, containers, 0, nil)
+}
+
+func TestContainersHungInspectUsesCache(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	var mu sync.Mutex
+	hung := false
+	healthy := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		isHung := hung
+		mu.Unlock()
+		if isHung {
+			dockerHungInspectHandler(release).ServeHTTP(w, r)
+			return
+		}
+		dockerFakeHandler(t, inspectHealthy).ServeHTTP(w, r)
+	})
+	socket := newDockerFake(t, healthy)
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	client := &DockerClient{SocketPath: socket, ListTimeout: time.Second, InspectTimeout: 100 * time.Millisecond}
+	healthyStatus := "healthy"
+
+	first, err := client.Containers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContainers(t, first, 4, &healthyStatus)
+
+	mu.Lock()
+	hung = true
+	mu.Unlock()
+	start := time.Now()
+	second, err := client.Containers(context.Background())
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Errorf("Containers took %v, want well within ListTimeout+InspectTimeout", elapsed)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertContainers(t, second, 4, &healthyStatus)
+}
+
+func TestContainersOversizedResponseIsError(t *testing.T) {
+	socket := newDockerFake(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("["))
+		chunk := strings.Repeat(" ", 1<<20)
+		for range 17 {
+			_, _ = w.Write([]byte(chunk))
+		}
+		_, _ = w.Write([]byte("]"))
+	}))
+	client := &DockerClient{SocketPath: socket}
+
+	containers, err := client.Containers(context.Background())
+	if containers != nil || err == nil {
+		t.Errorf("Containers = %v, %v; want nil, error", containers, err)
 	}
 }

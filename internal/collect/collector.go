@@ -11,6 +11,8 @@ import (
 
 // Options configure a Collector. Zero values become defaults: Root "/",
 // RealStatfs, ExecRunner, {Root}/var/run/docker.sock and slog.Default().
+// Docker listing is bounded by 3 s plus 5 s of shared inspect time, so one
+// Collect call takes at most about 8 s.
 type Options struct {
 	Root         string
 	Statfs       StatfsFunc
