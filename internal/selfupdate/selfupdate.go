@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pentacore/lookout/internal/buildinfo"
@@ -32,6 +33,8 @@ const (
 	maxSignature       = 64 << 10
 	maxBinary          = 64 << 20
 	maxRedirects       = 10
+	preflightAttempts  = 3
+	preflightRetryWait = 100 * time.Millisecond
 
 	apiTimeout       = 30 * time.Second
 	downloadTimeout  = 10 * time.Minute
@@ -61,7 +64,10 @@ var (
 // runtime.GOARCH, Exe from the resolved os.Executable, the pentacore/lookout
 // releases/latest URL, a 64 MiB download cap, an HTTP client that only
 // follows https redirects, os/exec, a context-aware sleep, math/rand and a
-// text logger on stderr. It is not safe for concurrent use.
+// text logger on stderr. A caller-supplied HTTP client without a redirect
+// policy is used through a copy that only follows https redirects, and any
+// response that did not end on an https URL is refused. Exe must be
+// absolute. It is not safe for concurrent use.
 type Updater struct {
 	Current, PublicKey, Arch, Exe, PersistCopy, ReleaseURL string
 
@@ -167,7 +173,7 @@ func (u *Updater) Check(ctx context.Context) (newVersion string, err error) {
 	if err := u.preflight(ctx, exe, bin, version); err != nil {
 		return "", err
 	}
-	if err := Install(exe, bin, u.PersistCopy); err != nil {
+	if err := Install(exe, bin, u.PersistCopy, u.Logger); err != nil {
 		return "", fmt.Errorf("install %s: %w", version, err)
 	}
 	return version, nil
@@ -233,6 +239,10 @@ func (u *Updater) get(ctx context.Context, rawURL, accept string, limit int64) (
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	// A caller-supplied client may follow redirects without httpsOnlyRedirect.
+	if final := resp.Request.URL; final.Scheme != "https" {
+		return nil, fmt.Errorf("refusing redirect to non-https %s", truncate(final.Redacted()))
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
@@ -253,17 +263,31 @@ func (u *Updater) get(ctx context.Context, rawURL, accept string, limit int64) (
 // preflight writes bin to {exe}.new, runs "{exe}.new version" and requires
 // exactly "lookout {version}\n", so a binary that cannot start (wrong arch,
 // truncated) never replaces the running one. {exe}.new is always removed;
-// Install writes it again from the same verified bytes.
+// Install writes it again from the same verified bytes. An exec that fails
+// with ETXTBSY (another goroutine's fork still holds the file open for
+// writing) is retried up to 3 times, 100 ms apart.
 func (u *Updater) preflight(ctx context.Context, exe string, bin []byte, version string) error {
 	tmp := exe + ".new"
 	if err := writeExecutable(tmp, bin, true); err != nil {
-		return fmt.Errorf("preflight failed: write %s: %w", tmp, err)
+		return fmt.Errorf("preflight failed: write %s: %w", tmp, installDirError(exe, err))
 	}
 	defer func() { _ = os.Remove(tmp) }()
 
 	ctx, cancel := context.WithTimeout(ctx, preflightTimeout)
 	defer cancel()
-	out, err := u.Exec(ctx, tmp, "version")
+	var (
+		out []byte
+		err error
+	)
+	for attempt := 1; ; attempt++ {
+		out, err = u.Exec(ctx, tmp, "version")
+		if !errors.Is(err, syscall.ETXTBSY) || attempt == preflightAttempts {
+			break
+		}
+		if sleep(ctx, preflightRetryWait) != nil {
+			break
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("preflight failed: %s version: %w", tmp, err)
 	}
@@ -275,6 +299,9 @@ func (u *Updater) preflight(ctx context.Context, exe string, bin []byte, version
 
 func (u *Updater) executable() (string, error) {
 	if u.Exe != "" {
+		if !filepath.IsAbs(u.Exe) {
+			return "", fmt.Errorf("executable path %q is not absolute", u.Exe)
+		}
 		return u.Exe, nil
 	}
 	exe, err := os.Executable()
@@ -303,6 +330,11 @@ func (u *Updater) setDefaults() {
 	}
 	if u.HTTP == nil {
 		u.HTTP = &http.Client{CheckRedirect: httpsOnlyRedirect}
+	} else if u.HTTP.CheckRedirect == nil {
+		// Copy the caller's client rather than change it.
+		client := *u.HTTP
+		client.CheckRedirect = httpsOnlyRedirect
+		u.HTTP = &client
 	}
 	if u.Exec == nil {
 		u.Exec = runCommand

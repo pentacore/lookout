@@ -44,7 +44,7 @@ func TestInstall(t *testing.T) {
 	persist := filepath.Join(persistDir, "lookout")
 	writeFile(t, persist, []byte("old"), 0o600)
 
-	if err := Install(exe, []byte("new"), persist); err != nil {
+	if err := Install(exe, []byte("new"), persist, nil); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 
@@ -66,7 +66,7 @@ func TestInstallWithoutPersistCopy(t *testing.T) {
 	exe := filepath.Join(dir, "lookout")
 	writeFile(t, exe, []byte("old"), 0o755)
 
-	if err := Install(exe, []byte("new"), ""); err != nil {
+	if err := Install(exe, []byte("new"), "", nil); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	assertFile(t, exe, []byte("new"))
@@ -91,7 +91,7 @@ func TestInstallReplacesStaleTempFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := Install(exe, []byte("new"), ""); err != nil {
+	if err := Install(exe, []byte("new"), "", nil); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	assertFile(t, exe, []byte("new"))
@@ -105,7 +105,7 @@ func TestInstallPersistCopyFailureLeavesExeUntouched(t *testing.T) {
 	writeFile(t, exe, []byte("old"), 0o755)
 	persist := filepath.Join(dir, "missing-dir", "lookout")
 
-	err := Install(exe, []byte("new"), persist)
+	err := Install(exe, []byte("new"), persist, nil)
 	if err == nil || !strings.Contains(err.Error(), "persist") {
 		t.Fatalf("Install error = %v, want a persistent copy error", err)
 	}
@@ -122,7 +122,7 @@ func TestInstallFailureRemovesTempFile(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(exe, "keep"), []byte("x"), 0o600)
 
-	if err := Install(exe, []byte("new"), ""); err == nil {
+	if err := Install(exe, []byte("new"), "", nil); err == nil {
 		t.Fatal("Install over a directory succeeded")
 	}
 	assertNoFile(t, exe+".new")

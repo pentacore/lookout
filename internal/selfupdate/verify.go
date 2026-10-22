@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"aead.dev/minisign"
 )
@@ -101,11 +102,16 @@ func (c *capReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// truncate shortens untrusted text before it goes into an error message.
+// truncate shortens untrusted text before it goes into an error message,
+// cutting before any rune that would not fit whole.
 func truncate(s string) string {
 	const maxLen = 200
-	if len(s) > maxLen {
-		return s[:maxLen] + "…"
+	if len(s) <= maxLen {
+		return s
 	}
-	return s
+	n := maxLen
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }

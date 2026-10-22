@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -11,24 +12,29 @@ import (
 
 // Install atomically replaces exe with bin: it writes {exe}.new (0755) in the
 // same directory, fsyncs it, renames it over exe and fsyncs the directory.
+// Once a rename has happened that file counts as replaced: a failed directory
+// fsync is logged to logger (slog.Default() when nil), not returned.
 // When persistCopy is set (Unraid's copy on the flash drive, restored at
 // boot) it is replaced the same way through {persistCopy}.tmp, first: a
 // failure there leaves the running install untouched, and a failure on exe
 // afterwards leaves a verified newer binary on the flash, which is harmless.
-func Install(exe string, bin []byte, persistCopy string) error {
+func Install(exe string, bin []byte, persistCopy string, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if persistCopy != "" {
 		// The flash is vfat, whose fixed file modes may refuse a chmod.
-		if err := replaceFile(persistCopy+".tmp", persistCopy, bin, false); err != nil {
+		if err := replaceFile(persistCopy+".tmp", persistCopy, bin, false, logger); err != nil {
 			return fmt.Errorf("write persistent copy %s: %w", persistCopy, err)
 		}
 	}
-	if err := replaceFile(exe+".new", exe, bin, true); err != nil {
-		return fmt.Errorf("replace %s: %w", exe, err)
+	if err := replaceFile(exe+".new", exe, bin, true, logger); err != nil {
+		return fmt.Errorf("replace %s: %w", exe, installDirError(exe, err))
 	}
 	return nil
 }
 
-func replaceFile(tmp, dst string, data []byte, requireMode bool) error {
+func replaceFile(tmp, dst string, data []byte, requireMode bool, logger *slog.Logger) error {
 	if err := writeExecutable(tmp, data, requireMode); err != nil {
 		return err
 	}
@@ -36,7 +42,22 @@ func replaceFile(tmp, dst string, data []byte, requireMode bool) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return syncDir(filepath.Dir(dst))
+	if err := syncDirFunc(filepath.Dir(dst)); err != nil {
+		logger.Warn("self-update: replaced the file but could not fsync its directory", "path", dst, "error", err)
+	}
+	return nil
+}
+
+// syncDirFunc is syncDir; tests replace it to simulate fsync failures.
+var syncDirFunc = syncDir
+
+// installDirError labels a write that failed because the directory holding
+// exe is read-only or not writable by the agent, which an operator has to fix.
+func installDirError(exe string, err error) error {
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS) {
+		return fmt.Errorf("install directory %s is not writable: %w", filepath.Dir(exe), err)
+	}
+	return err
 }
 
 // writeExecutable writes data to path as a new 0755 file and fsyncs it. A
