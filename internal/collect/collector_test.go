@@ -141,3 +141,41 @@ func TestNewDefaults(t *testing.T) {
 		t.Error("defaults not filled in")
 	}
 }
+
+// A panic in a source must not take the agent down: a release that panics
+// while collecting would otherwise restart in a loop before its first
+// self-update check. The source is reported as failed instead.
+func TestCollectorRecoversFromPanics(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "run/systemd/system"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "proc/self"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mountinfo := "22 1 0:21 / / rw,relatime - ext4 /dev/sda1 rw\n"
+	if err := os.WriteFile(filepath.Join(root, "proc/self/mountinfo"), []byte(mountinfo), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logger, logs := newCollectorLogger()
+	c := New(Options{
+		Root:       root,
+		Statfs:     func(string) (StatfsResult, error) { panic("statfs exploded") },
+		RunCommand: func(context.Context, string, ...string) ([]byte, error) { panic("systemctl exploded") },
+		Logger:     logger,
+	})
+
+	_, metrics := c.Collect(context.Background())
+
+	if len(metrics.Filesystems) != 1 || !metrics.Filesystems[0].Unresponsive {
+		t.Errorf("Filesystems = %+v, want / reported unresponsive", metrics.Filesystems)
+	}
+	if metrics.FailedUnits != nil {
+		t.Errorf("FailedUnits = %#v, want nil after a panic", metrics.FailedUnits)
+	}
+	for _, want := range []string{"statfs exploded", "systemctl exploded", "level=ERROR", "goroutine"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log lacks %q:\n%s", want, logs.String())
+		}
+	}
+}

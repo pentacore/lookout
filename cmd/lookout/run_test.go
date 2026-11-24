@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,8 +64,42 @@ func (fakeCollector) Collect(context.Context) (wire.Host, wire.Metrics) {
 	return wire.Host{Hostname: "test"}, wire.Metrics{}
 }
 
-// startAgent runs runAgent in the background with a short config poll.
+// fakeUpdater stands in for *selfupdate.Updater. A nil check reports that
+// the running version is the latest.
+type fakeUpdater struct {
+	loop   func(context.Context) error
+	check  func(context.Context) (string, error)
+	checks atomic.Int32
+}
+
+func (u *fakeUpdater) Loop(ctx context.Context) error {
+	if u.loop == nil {
+		<-ctx.Done()
+		return nil
+	}
+	return u.loop(ctx)
+}
+
+func (u *fakeUpdater) Check(ctx context.Context) (string, error) {
+	u.checks.Add(1)
+	if u.check == nil {
+		return "", nil
+	}
+	return u.check(ctx)
+}
+
+// startAgent runs runAgent in the background with a short config poll and,
+// unless updaterLoop is nil, an updater whose Loop is updaterLoop.
 func startAgent(t *testing.T, cfgPath string, updaterLoop func(context.Context) error) *runningAgent {
+	t.Helper()
+	if updaterLoop == nil {
+		return startAgentWith(t, cfgPath, nil)
+	}
+	return startAgentWith(t, cfgPath, &fakeUpdater{loop: updaterLoop})
+}
+
+// startAgentWith runs runAgent in the background with a short config poll.
+func startAgentWith(t *testing.T, cfgPath string, updater agentUpdater) *runningAgent {
 	t.Helper()
 	oldCollector := newCollector
 	newCollector = func(*slog.Logger) agent.Collector { return fakeCollector{} }
@@ -76,7 +112,7 @@ func startAgent(t *testing.T, cfgPath string, updaterLoop func(context.Context) 
 	t.Cleanup(cancel)
 	log := &syncBuffer{}
 	done := make(chan int, 1)
-	go func() { done <- runAgent(ctx, cfgPath, slog.New(slog.NewTextHandler(log, nil)), updaterLoop) }()
+	go func() { done <- runAgent(ctx, cfgPath, slog.New(slog.NewTextHandler(log, nil)), updater) }()
 	return &runningAgent{cancel: cancel, done: done, log: log}
 }
 
@@ -234,5 +270,153 @@ func TestLeaveWorkingDir(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil || cwd != "/" {
 		t.Fatalf("working dir = %q, %v; want /", cwd, err)
+	}
+}
+
+// markAbnormalExit leaves the marker a run that did not end cleanly leaves.
+func markAbnormalExit(t *testing.T, env testEnv) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(env.dir, "run"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(env.dir, "run", runningMarker), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A release that crashes soon after starting never reaches the updater's
+// first check five minutes in. After a run that did not end cleanly, the
+// next start checks for an update before it reports, and exits for the
+// service manager to start the update.
+func TestRunAgentChecksForUpdateAfterAbnormalExit(t *testing.T) {
+	srv, requests := reportServer(t)
+	env := newTestEnv(t, srv.URL)
+	env.saveCredentials("srv-1")
+	markAbnormalExit(t, env)
+	u := &fakeUpdater{check: func(context.Context) (string, error) { return "0.2.0", nil }}
+	a := startAgentWith(t, env.config, u)
+
+	if code := a.wait(t); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if got := u.checks.Load(); got != 1 {
+		t.Errorf("update checks = %d, want 1", got)
+	}
+	select {
+	case <-requests:
+		t.Error("reported before installing the update")
+	default:
+	}
+	if log := a.log.String(); !strings.Contains(log, "previous run did not exit cleanly") || !strings.Contains(log, "updated; exiting") {
+		t.Errorf("log:\n%s", log)
+	}
+}
+
+func TestRunAgentReportsWhenEarlyCheckFindsNothing(t *testing.T) {
+	srv, requests := reportServer(t)
+	env := newTestEnv(t, srv.URL)
+	env.saveCredentials("srv-1")
+	markAbnormalExit(t, env)
+	u := &fakeUpdater{check: func(context.Context) (string, error) { return "", errors.New("HTTP 403") }}
+	a := startAgentWith(t, env.config, u)
+
+	awaitRequest(t, requests, a)
+	a.cancel()
+	a.wait(t)
+	if got := u.checks.Load(); got != 1 {
+		t.Errorf("update checks = %d, want 1", got)
+	}
+	if !strings.Contains(a.log.String(), "HTTP 403") {
+		t.Errorf("log lacks the failed check:\n%s", a.log.String())
+	}
+}
+
+// A clean exit removes the marker, so the next start does not check early.
+func TestRunAgentCleanExitSkipsEarlyCheck(t *testing.T) {
+	srv, requests := reportServer(t)
+	env := newTestEnv(t, srv.URL)
+	env.saveCredentials("srv-1")
+
+	for range 2 {
+		u := &fakeUpdater{}
+		a := startAgentWith(t, env.config, u)
+		awaitRequest(t, requests, a)
+		a.cancel()
+		a.wait(t)
+		if got := u.checks.Load(); got != 0 {
+			t.Errorf("update checks = %d, want 0", got)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(env.dir, "run", runningMarker)); !os.IsNotExist(err) {
+		t.Errorf("marker after a clean exit: %v, want it removed", err)
+	}
+}
+
+// A release stuck in a crash loop checks at most once per earlyCheckInterval,
+// which keeps it well inside GitHub's unauthenticated API rate limit.
+func TestRunAgentThrottlesEarlyChecks(t *testing.T) {
+	srv, requests := reportServer(t)
+	env := newTestEnv(t, srv.URL)
+	env.saveCredentials("srv-1")
+
+	u := &fakeUpdater{}
+	for range 2 {
+		markAbnormalExit(t, env)
+		a := startAgentWith(t, env.config, u)
+		awaitRequest(t, requests, a)
+		a.cancel()
+		a.wait(t)
+	}
+	if got := u.checks.Load(); got != 1 {
+		t.Errorf("update checks = %d, want 1 within the throttle window", got)
+	}
+}
+
+func TestRunAgentNoEarlyCheckWhenAutoUpdateOff(t *testing.T) {
+	srv, requests := reportServer(t)
+	env := newTestEnv(t, srv.URL, "auto_update: false")
+	env.saveCredentials("srv-1")
+	markAbnormalExit(t, env)
+	u := &fakeUpdater{}
+	a := startAgentWith(t, env.config, u)
+
+	awaitRequest(t, requests, a)
+	a.cancel()
+	a.wait(t)
+	if got := u.checks.Load(); got != 0 {
+		t.Errorf("update checks = %d, want 0 with auto_update: false", got)
+	}
+}
+
+// The reporter is built from the platform_url in the file at the time it is
+// called, so credentials loaded after an enroll --force that switched the
+// URL go to the new platform.
+func TestReporterForReadsCurrentPlatformURL(t *testing.T) {
+	first, firstRequests := reportServer(t)
+	second, secondRequests := reportServer(t)
+	env := newTestEnv(t, first.URL)
+	newReporter := reporterFor(env.config)
+
+	send := func() {
+		t.Helper()
+		r, err := newReporter()
+		if err != nil {
+			t.Fatalf("reporterFor: %v", err)
+		}
+		if _, err := r.Report(context.Background(), "srv.secret", wire.ReportRequest{}); err != nil {
+			t.Fatalf("Report: %v", err)
+		}
+	}
+	send()
+	env.writeConfig("platform_url: " + second.URL + "\n")
+	send()
+
+	if len(firstRequests) != 1 || len(secondRequests) != 1 {
+		t.Errorf("requests: first %d, second %d; want one each", len(firstRequests), len(secondRequests))
+	}
+
+	env.writeConfig("platform_url: \"\"\n")
+	if _, err := newReporter(); err == nil {
+		t.Error("reporterFor accepted an empty platform_url")
 	}
 }

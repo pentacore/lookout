@@ -73,6 +73,8 @@ type harness struct {
 	runtimeDir string
 	backoff    *platform.Backoff
 	log        bytes.Buffer
+
+	newReporter func() (Reporter, error)
 }
 
 func newHarness(t *testing.T, maxSleeps int) *harness {
@@ -183,15 +185,16 @@ func (h *harness) runWith(ctx context.Context, cancel context.CancelFunc) {
 	h.t.Helper()
 	h.cancel = cancel
 	a := New(Deps{
-		Reporter:   h,
-		Collector:  h,
-		Checks:     h,
-		Store:      h,
-		RuntimeDir: h.runtimeDir,
-		Now:        func() time.Time { return testNow },
-		Sleep:      h.sleep,
-		Backoff:    h.backoff,
-		Logger:     slog.New(slog.NewTextHandler(&h.log, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Reporter:    h,
+		Collector:   h,
+		Checks:      h,
+		Store:       h,
+		RuntimeDir:  h.runtimeDir,
+		Now:         func() time.Time { return testNow },
+		Sleep:       h.sleep,
+		Backoff:     h.backoff,
+		NewReporter: h.newReporter,
+		Logger:      slog.New(slog.NewTextHandler(&h.log, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx) }()
@@ -693,5 +696,105 @@ func TestNewFillsDefaults(t *testing.T) {
 	}
 	if err := a.d.Sleep(context.Background(), time.Millisecond); err != nil {
 		t.Errorf("default Sleep = %v, want nil", err)
+	}
+}
+
+// A platform that resends the config the agent already has (same version,
+// checks and interval) must not make the agent rewrite the state file: on
+// Unraid it lives on the flash drive.
+func TestAgentDoesNotResaveUnchangedConfig(t *testing.T) {
+	h := newHarness(t, 4)
+	h.cfg = state.PlatformConfig{ConfigVersion: 3, ReportIntervalSeconds: 60, Checks: []wire.CheckConfig{check1}}
+	same := wire.ReportResponse{ConfigVersion: 3, Config: &wire.PlatformConfig{Checks: []wire.CheckConfig{check1}}, ReportIntervalSeconds: 60}
+	newer := wire.ReportResponse{ConfigVersion: 4, Config: &wire.PlatformConfig{Checks: []wire.CheckConfig{check1}}, ReportIntervalSeconds: 60}
+	h.reports = []reportStep{{resp: same}, {resp: newer}, {resp: newer}}
+	h.run()
+
+	want := []state.PlatformConfig{{ConfigVersion: 4, ReportIntervalSeconds: 60, Checks: []wire.CheckConfig{check1}}}
+	if !reflect.DeepEqual(h.saved, want) {
+		t.Errorf("saved = %+v, want only the version 4 config once", h.saved)
+	}
+}
+
+// A config whose save failed is saved again when the platform resends it.
+func TestAgentRetriesSaveAfterFailure(t *testing.T) {
+	h := newHarness(t, 3)
+	h.saveErr = errors.New("read-only file system")
+	resp := wire.ReportResponse{ConfigVersion: 4, Config: &wire.PlatformConfig{Checks: []wire.CheckConfig{check1}}, ReportIntervalSeconds: 60}
+	h.reports = []reportStep{{resp: resp}, {resp: resp}}
+	h.run()
+
+	if len(h.saved) != 2 {
+		t.Errorf("SavePlatformConfig called %d times, want 2 (the first save failed)", len(h.saved))
+	}
+}
+
+// fakeReporter is a second platform client that records the tokens it got.
+type fakeReporter struct {
+	mu     sync.Mutex
+	name   string
+	tokens []string
+}
+
+func (r *fakeReporter) Report(_ context.Context, token string, _ wire.ReportRequest) (wire.ReportResponse, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tokens = append(r.tokens, token)
+	return wire.ReportResponse{ReportIntervalSeconds: 60}, nil
+}
+
+// lookout enroll --force can switch platform_url; credentials loaded after
+// that must go to the platform that issued them, not to the one the agent
+// started with.
+func TestAgentRebuildsReporterWhenCredentialsLoad(t *testing.T) {
+	h := newHarness(t, 3)
+	h.reports = []reportStep{{err: statusErr(401, "")}}
+	newCreds := state.Credentials{ServerUUID: "new", AgentToken: "new.token"}
+	h.credSteps = []credStep{{creds: testCreds}, {creds: newCreds}}
+	other := &fakeReporter{name: "new platform"}
+	calls := 0
+	h.newReporter = func() (Reporter, error) {
+		calls++
+		if calls == 1 {
+			return h, nil
+		}
+		return other, nil
+	}
+	h.run()
+
+	if calls != 2 {
+		t.Errorf("NewReporter called %d times, want once per credentials load (2)", calls)
+	}
+	if !reflect.DeepEqual(h.tokens, []string{testToken}) {
+		t.Errorf("old platform got tokens %v, want only the old token", h.tokens)
+	}
+	if !reflect.DeepEqual(other.tokens, []string{"new.token", "new.token"}) {
+		t.Errorf("new platform got tokens %v, want the new token", other.tokens)
+	}
+}
+
+// A platform_url that cannot be read after re-enrolling holds the reports
+// instead of sending the new credentials to the old platform.
+func TestAgentWaitsWhenReporterCannotBeBuilt(t *testing.T) {
+	h := newHarness(t, 3)
+	calls := 0
+	h.newReporter = func() (Reporter, error) {
+		calls++
+		if calls < 3 {
+			return nil, errors.New("platform_url is required")
+		}
+		return h, nil
+	}
+	h.run()
+
+	want := []time.Duration{15 * time.Second, 15 * time.Second, time.Minute}
+	if !reflect.DeepEqual(h.sleeps, want) {
+		t.Errorf("sleeps = %v, want %v", h.sleeps, want)
+	}
+	if len(h.requests) != 1 {
+		t.Errorf("reports = %d, want 1 once the reporter could be built", len(h.requests))
+	}
+	if got := strings.Count(h.log.String(), "cannot load platform_url"); got != 1 {
+		t.Errorf("logged the platform_url problem %d times, want once:\n%s", got, h.log.String())
 	}
 }

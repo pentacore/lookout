@@ -26,9 +26,9 @@ The script downloads the release archive, verifies it, installs `/usr/local/bin/
 | `--token` | Enrollment token. Required until the server is enrolled, unless `LOOKOUT_TOKEN` is set. `--token` wins when both are given. |
 | `--version` | Release to install, such as `0.2.0` or `latest`. Defaults to the version the script was released with. |
 
-Running the script again is safe. It upgrades the binary, keeps `/etc/lookout/lookout.yaml` and restarts the service. With no `--url` it reuses the `platform_url` from the config. Giving a token (`--token` or `LOOKOUT_TOKEN`) on an enrolled server re-enrolls it. Existing credentials are never pointed at a different platform: a different `--url` on an enrolled server is refused unless you also give a token, and then the server is re-enrolled with the new platform. `lookout enroll --force` changes `platform_url` only after the platform has accepted the token, so a failed re-enroll leaves the config and the old credentials as they were.
+Running the script again is safe. It upgrades the binary, keeps `/etc/lookout/lookout.yaml` and restarts the service. With no `--url` it reuses the `platform_url` from the config. Giving a token (`--token` or `LOOKOUT_TOKEN`) on an enrolled server re-enrolls it. Existing credentials are never pointed at a different platform: a different `--url` on an enrolled server is refused unless you also give a token, and then the server is re-enrolled with the new platform. `lookout enroll --force` changes `platform_url` only after the platform has accepted the token, so a failed re-enroll leaves the config and the old credentials as they were. A config whose `platform_url` is empty takes `--url` like a first install. The downloaded binary must run and report the expected version before it replaces the installed one, and a run the script refuses leaves the installed binary as it was.
 
-To enroll by hand, run `lookout enroll --url https://media.example.com` with the token in `LOOKOUT_TOKEN` (or `--token <TOKEN>`), then `systemctl restart lookout`: a running agent keeps the identity it started with.
+To enroll by hand, run `lookout enroll --url https://media.example.com` with the token in `LOOKOUT_TOKEN` (or `--token <TOKEN>`), then `systemctl restart lookout`: a running agent keeps the identity it started with. Only when the platform rejects that identity does it load the credentials again, together with the `platform_url` from the config, so new credentials always go to the platform that issued them.
 
 ### The enrollment token
 
@@ -130,3 +130,5 @@ When a newer release than its own version is out, the agent downloads the archiv
 - The archive holds exactly one `lookout` entry, a regular file, and the new binary reports the expected version when run with `lookout version`.
 
 A build without an embedded public key, such as a local `go build` or a `dev` build, never self-updates.
+
+The agent first checks for a release 5 minutes after it starts, then every 6 hours. When its previous run did not exit cleanly (it crashed or was killed), it checks once before its first report instead, at most once every 10 minutes. A release that crashes soon after starting can then still be replaced by publishing a fixed one.

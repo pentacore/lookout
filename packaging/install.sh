@@ -186,7 +186,7 @@ main() {
 	base="${LOOKOUT_DOWNLOAD_BASE:-$default_base}"
 
 	tmp=$(mktemp -d)
-	trap 'rm -rf "$tmp"' EXIT
+	trap 'rm -rf "$tmp"; rm -f "$BIN_PATH.new"' EXIT
 	trap 'exit 1' INT TERM HUP
 	for file in "$name" checksums.txt "$name.minisig"; do
 		curl --proto '=https' --tlsv1.2 -fsSL -o "$tmp/$file" "$base/$file" || die "download failed: $file"
@@ -209,36 +209,66 @@ main() {
 
 	tar -xzf "$tmp/$name" -C "$tmp" lookout || die "could not extract $name"
 	mkdir -p "$(dirname "$BIN_PATH")"
-	install -m 0755 "$tmp/lookout" "$BIN_PATH.new"
-	mv -f "$BIN_PATH.new" "$BIN_PATH"
+	staged="$BIN_PATH.new"
+	install -m 0755 "$tmp/lookout" "$staged"
+
+	# The new binary has to run here, and be the release asked for, before it
+	# replaces the installed one; until the mv below it is only staged.
+	new_version=$("$staged" version 2>/dev/null) || die "the downloaded lookout does not run on this machine ($arch)"
+	case "$version" in
+	latest)
+		case "$new_version" in
+		"lookout "?*) ;;
+		*) die "the downloaded lookout reports [$new_version], want [lookout <version>]" ;;
+		esac
+		;;
+	*) [ "$new_version" = "lookout ${version#v}" ] || die "the downloaded lookout reports [$new_version], want [lookout ${version#v}]" ;;
+	esac
 
 	# Existing credentials must never be pointed at a different platform, so a
 	# changed --url is only ever applied by re-enrolling (enroll --force).
 	switching=no
+	url_was_empty=no
+	check_config="$CONFIG_PATH"
 	if [ ! -f "$CONFIG_PATH" ]; then
 		write_config "$CONFIG_PATH" "$platform_url"
 	else
 		existing_url=$(config_url "$CONFIG_PATH")
-		if [ -n "$platform_url" ] && [ "${platform_url%/}" != "${existing_url%/}" ]; then
+		if [ -z "$existing_url" ] && [ -n "$platform_url" ]; then
+			# Nothing to switch from. Check the config as it will be once
+			# enroll has written the URL; the file itself is left to enroll.
+			url_was_empty=yes
+			check_config="$tmp/lookout.yaml"
+			cp "$CONFIG_PATH" "$check_config"
+			write_config "$check_config" "$platform_url"
+		elif [ -n "$platform_url" ] && [ "${platform_url%/}" != "${existing_url%/}" ]; then
 			switching=yes
 		else
 			platform_url="$existing_url"
 		fi
 	fi
 
-	if ! check_out=$("$BIN_PATH" check-config --config "$CONFIG_PATH" 2>"$tmp/check-config.err"); then
+	if ! check_out=$("$staged" check-config --config "$check_config" 2>"$tmp/check-config.err"); then
 		die "check-config failed: $(cat "$tmp/check-config.err")"
 	fi
 	enrolled=no
 	if printf '%s\n' "$check_out" | grep -q '^enrolled: *yes'; then
 		enrolled=yes
 	fi
-
+	# Credentials next to an empty platform_url came from an unknown platform.
+	if [ "$url_was_empty" = yes ] && [ "$enrolled" = yes ]; then
+		switching=yes
+	fi
+	# Every refusal comes before the mv, so a refused run changes nothing.
 	if [ -z "$token" ]; then
 		[ "$enrolled" = no ] || [ "$switching" = no ] || die "--url changes the platform; pass --token or LOOKOUT_TOKEN to re-enroll"
 		[ "$enrolled" = yes ] || die "--token or LOOKOUT_TOKEN is required (this server is not enrolled yet)"
 	else
 		[ -n "$platform_url" ] || die "no platform_url in $CONFIG_PATH; pass --url"
+	fi
+	mv -f "$staged" "$BIN_PATH"
+
+	if [ -n "$token" ]; then
 		if [ "$enrolled" = yes ] || [ "$switching" = yes ]; then
 			enroll_server --force
 		else

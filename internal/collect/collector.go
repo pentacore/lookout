@@ -2,8 +2,10 @@ package collect
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 
 	"github.com/pentacore/lookout/internal/wire"
@@ -60,23 +62,26 @@ func New(o Options) *Collector {
 
 // Collect gathers the host and its metrics. Each source has its own timeout,
 // and one that fails leaves its field at the zero value (or null for the
-// optional ones) and logs one warning; it never aborts the report. Collect
-// must not be called concurrently.
+// optional ones) and logs one warning; it never aborts the report. A source
+// that panics is treated the same way, with the panic and its stack logged
+// as an error: an agent that panics while collecting would restart in a loop
+// and never reach its first self-update check. Collect must not be called
+// concurrently.
 func (c *Collector) Collect(ctx context.Context) (wire.Host, wire.Metrics) {
 	var metrics wire.Metrics
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		metrics.Filesystems = c.filesystems()
+		metrics.Filesystems = guard(c, "filesystems", []wire.Filesystem{}, c.filesystems)
 	})
 	wg.Go(func() {
-		metrics.FailedUnits = c.failedUnits(ctx)
+		metrics.FailedUnits = guard(c, "failed units", nil, func() []string { return c.failedUnits(ctx) })
 	})
 	wg.Go(func() {
-		metrics.Containers = c.containers(ctx)
+		metrics.Containers = guard(c, "containers", nil, func() []wire.Container { return c.containers(ctx) })
 	})
 
-	host := ReadHost(c.root)
+	host := guard(c, "host", wire.Host{}, func() wire.Host { return ReadHost(c.root) })
 	metrics.CPUPercent = warnOnError(c, "cpu", c.cpu.Percent)
 	metrics.Load = warnOnError(c, "load", func() ([3]float64, error) { return ReadLoad(c.root) })
 	metrics.Memory = warnOnError(c, "memory", func() (wire.Memory, error) { return ReadMemory(c.root) })
@@ -86,12 +91,37 @@ func (c *Collector) Collect(ctx context.Context) (wire.Host, wire.Metrics) {
 	return host, metrics
 }
 
-// warnOnError returns read's value, or the zero value plus a warning when it fails.
-func warnOnError[T any](c *Collector, source string, read func() (T, error)) T {
+// guard returns read's value, or fallback when read panics. The panic is
+// logged with its stack.
+func guard[T any](c *Collector, source string, fallback T, read func() T) (value T) {
+	defer func() {
+		if v := recover(); v != nil {
+			logPanic(c.logger, source, v)
+			value = fallback
+		}
+	}()
+	return read()
+}
+
+// logPanic logs a recovered panic and the stack of the goroutine that
+// panicked. It must be called from the deferred function that recovered.
+func logPanic(logger *slog.Logger, source string, v any) {
+	logger.Error("collect panicked", "source", source, "panic", fmt.Sprint(v), "stack", string(debug.Stack()))
+}
+
+// warnOnError returns read's value, or the zero value when it fails (logged
+// as a warning) or panics (logged as an error).
+func warnOnError[T any](c *Collector, source string, read func() (T, error)) (value T) {
+	var zero T
+	defer func() {
+		if v := recover(); v != nil {
+			logPanic(c.logger, source, v)
+			value = zero
+		}
+	}()
 	value, err := read()
 	if err != nil {
 		c.logger.Warn("collect failed", "source", source, "err", err)
-		var zero T
 		return zero
 	}
 	return value

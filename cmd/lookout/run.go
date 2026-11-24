@@ -33,6 +33,24 @@ const unraidPersistCopy = "/boot/config/plugins/lookout/lookout"
 // invalid. Tests shorten it.
 var configPollInterval = 15 * time.Second
 
+const (
+	// runningMarker exists in the runtime directory while the agent runs and
+	// is removed when it exits cleanly. Finding it at start means the
+	// previous run crashed or was killed.
+	runningMarker = "running"
+	// earlyCheckMarker's mtime is the last early update check.
+	earlyCheckMarker = "early-update-check"
+	// earlyCheckInterval spaces early update checks out while the agent keeps
+	// crashing, so a crash loop stays far below GitHub's API rate limit.
+	earlyCheckInterval = 10 * time.Minute
+)
+
+// agentUpdater is the self-updater as runAgent uses it: *selfupdate.Updater.
+type agentUpdater interface {
+	Loop(ctx context.Context) error
+	Check(ctx context.Context) (string, error)
+}
+
 // newCollector builds the host collector. Tests replace it so they do not
 // query the real Docker socket and systemd.
 var newCollector = func(logger *slog.Logger) agent.Collector {
@@ -63,7 +81,7 @@ func runService(args []string, stderr io.Writer) int {
 	if config.DetectPlatform("/") == config.PlatformUnraid {
 		updater.PersistCopy = unraidPersistCopy
 	}
-	return runAgent(ctx, cfgPath, logger, updater.Loop)
+	return runAgent(ctx, cfgPath, logger, updater)
 }
 
 // leaveWorkingDir changes to / so that the long-running agent never keeps
@@ -87,28 +105,125 @@ func leaveWorkingDir(cfgPath string) (string, error) {
 // manager restarts the new binary). Nothing else ends it: a missing or
 // invalid config, a missing enrollment, platform errors and an updater that
 // stops without installing (a development build) keep it running.
-func runAgent(ctx context.Context, cfgPath string, logger *slog.Logger, updaterLoop func(context.Context) error) int {
+//
+// When the previous run did not exit cleanly (see runningMarker) and
+// auto_update is on, it checks for an update before the first report, at
+// most once per earlyCheckInterval: a release that crashes within minutes of
+// starting would otherwise never reach the updater's first check and could
+// not be fixed by publishing a new release.
+func runAgent(ctx context.Context, cfgPath string, logger *slog.Logger, updater agentUpdater) int {
 	cfg, ok := waitForConfig(ctx, cfgPath, logger)
 	if !ok {
 		return 0
 	}
 
+	// Not deferred: a panic must leave the marker behind.
+	abnormal := markRunning(cfg.RuntimeDir, logger)
+	if abnormal && cfg.AutoUpdate && updater != nil && claimEarlyCheck(cfg.RuntimeDir, logger) {
+		if earlyUpdate(ctx, updater, logger) {
+			clearRunning(cfg.RuntimeDir, logger)
+			return 0
+		}
+	}
+	code := runReportLoop(ctx, cfg, cfgPath, logger, updater)
+	clearRunning(cfg.RuntimeDir, logger)
+	return code
+}
+
+// earlyUpdate runs one update check and reports whether runAgent should exit:
+// an update was installed or ctx was cancelled.
+func earlyUpdate(ctx context.Context, updater agentUpdater, logger *slog.Logger) bool {
+	logger.Warn("the previous run did not exit cleanly; checking for an update before reporting")
+	version, err := updater.Check(ctx)
+	switch {
+	case err == nil && version != "":
+		logger.Info("updated; exiting so the service manager restarts the new binary", "version", version)
+		return true
+	case ctx.Err() != nil:
+		return true
+	case errors.Is(err, selfupdate.ErrDevBuild), errors.Is(err, selfupdate.ErrNoPublicKey):
+		// The updater loop logs why updates are disabled.
+	case err != nil:
+		logger.Warn("early self-update check failed", "error", err)
+	}
+	return false
+}
+
+// markRunning creates runningMarker and reports whether it was already there.
+func markRunning(dir string, logger *slog.Logger) bool {
+	path := filepath.Join(dir, runningMarker)
+	_, err := os.Stat(path)
+	existed := err == nil
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		logger.Debug("cannot create runtime directory", "dir", dir, "error", err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		logger.Debug("cannot write run marker", "path", path, "error", err)
+	}
+	return existed
+}
+
+func clearRunning(dir string, logger *slog.Logger) {
+	if err := os.Remove(filepath.Join(dir, runningMarker)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		logger.Debug("cannot remove run marker", "dir", dir, "error", err)
+	}
+}
+
+// claimEarlyCheck reports whether an early update check is due, recording it
+// when it is. Without a record of the last check there is no early check, so
+// an unwritable runtime directory cannot turn a crash loop into a stream of
+// API requests.
+func claimEarlyCheck(dir string, logger *slog.Logger) bool {
+	path := filepath.Join(dir, earlyCheckMarker)
+	if info, err := os.Stat(path); err == nil && time.Since(info.ModTime()) < earlyCheckInterval {
+		return false
+	}
+	now := time.Now()
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		logger.Debug("cannot record the early update check", "path", path, "error", err)
+		return false
+	}
+	if err := os.Chtimes(path, now, now); err != nil {
+		logger.Debug("cannot record the early update check", "path", path, "error", err)
+		return false
+	}
+	return true
+}
+
+// reporterFor returns a function that builds a platform client for the
+// platform_url in the config at path as it is when called.
+func reporterFor(path string) func() (agent.Reporter, error) {
+	return func() (agent.Reporter, error) {
+		cfg, err := config.Load(path, config.DetectPlatform("/"))
+		if err == nil {
+			err = cfg.Validate()
+		}
+		if err != nil {
+			return nil, err
+		}
+		return platform.NewClient(cfg.BaseURL()), nil
+	}
+}
+
+// runReportLoop runs the agent and, with auto_update, the updater loop until
+// ctx is cancelled or an update was installed.
+func runReportLoop(ctx context.Context, cfg config.Config, cfgPath string, logger *slog.Logger, updater agentUpdater) int {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	a := agent.New(agent.Deps{
-		Reporter:   platform.NewClient(cfg.BaseURL()),
-		Collector:  newCollector(logger),
-		Checks:     &checks.Runner{Registry: checks.DefaultRegistry(), Env: checks.DefaultEnv("/", cfg.RuntimeDir), Version: buildinfo.Version},
-		Store:      state.Store{Dir: cfg.StateDir},
-		RuntimeDir: cfg.RuntimeDir,
-		Logger:     logger,
+		NewReporter: reporterFor(cfgPath),
+		Collector:   newCollector(logger),
+		Checks:      &checks.Runner{Registry: checks.DefaultRegistry(), Env: checks.DefaultEnv("/", cfg.RuntimeDir), Version: buildinfo.Version},
+		Store:       state.Store{Dir: cfg.StateDir},
+		RuntimeDir:  cfg.RuntimeDir,
+		Logger:      logger,
 	})
 
-	var updater sync.WaitGroup
-	if cfg.AutoUpdate && updaterLoop != nil {
-		updater.Go(func() {
-			err := updaterLoop(ctx)
+	var updating sync.WaitGroup
+	if cfg.AutoUpdate && updater != nil {
+		updating.Go(func() {
+			err := updater.Loop(ctx)
 			switch {
 			case errors.Is(err, selfupdate.ErrRestart):
 				logger.Info("updated; exiting so the service manager restarts the new binary")
@@ -121,7 +236,7 @@ func runAgent(ctx context.Context, cfgPath string, logger *slog.Logger, updaterL
 
 	_ = a.Run(ctx)
 	cancel()
-	updater.Wait()
+	updating.Wait()
 	return 0
 }
 
