@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"reflect"
 	"sync"
 	"time"
 
@@ -55,18 +56,25 @@ type Store interface {
 	SavePlatformConfig(state.PlatformConfig) error
 }
 
-// Deps are the agent's collaborators. Reporter, Collector, Checks and Store
-// are required; New fills the rest with real defaults when they are zero.
+// Deps are the agent's collaborators. Collector, Checks and Store are
+// required, and Reporter unless NewReporter is set; New fills the rest with
+// real defaults when they are zero.
+//
+// NewReporter, when set, builds the reporter for the platform_url configured
+// right now. It is called every time the credentials are loaded, so that
+// credentials from `lookout enroll --force` with a new URL go to the
+// platform that issued them. Until it succeeds the agent does not report.
 type Deps struct {
-	Reporter   Reporter
-	Collector  Collector
-	Checks     CheckRunner
-	Store      Store
-	RuntimeDir string
-	Now        func() time.Time
-	Sleep      func(ctx context.Context, d time.Duration) error
-	Backoff    *platform.Backoff
-	Logger     *slog.Logger
+	Reporter    Reporter
+	NewReporter func() (Reporter, error)
+	Collector   Collector
+	Checks      CheckRunner
+	Store       Store
+	RuntimeDir  string
+	Now         func() time.Time
+	Sleep       func(ctx context.Context, d time.Duration) error
+	Backoff     *platform.Backoff
+	Logger      *slog.Logger
 }
 
 // Agent is the report loop. It is not safe for concurrent use.
@@ -75,6 +83,8 @@ type Agent struct {
 	log *slog.Logger
 
 	creds         state.Credentials
+	reporter      Reporter
+	saved         state.PlatformConfig // what the state file holds, as far as the agent knows
 	configVersion int64
 	checks        []wire.CheckConfig
 	interval      time.Duration
@@ -101,7 +111,7 @@ func New(d Deps) *Agent {
 	if d.Logger == nil {
 		d.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
-	return &Agent{d: d, log: d.Logger, status: status{AgentVersion: buildinfo.Version}}
+	return &Agent{d: d, log: d.Logger, reporter: d.Reporter, status: status{AgentVersion: buildinfo.Version}}
 }
 
 // Run reports until ctx is cancelled, then returns nil. Platform errors,
@@ -136,20 +146,24 @@ func (a *Agent) Run(ctx context.Context) error {
 	return nil
 }
 
-// waitForCredentials loads the credentials, retrying every 15 s. Each kind of
-// failure (not enrolled, unreadable) is logged and written to the status file
-// once per wait. It returns false when ctx is cancelled first.
+// waitForCredentials loads the credentials and, with NewReporter, the
+// reporter for the current platform_url, retrying every 15 s. Each kind of
+// failure (not enrolled, unreadable, no usable platform_url) is logged and
+// written to the status file once per wait. It returns false when ctx is
+// cancelled first.
 func (a *Agent) waitForCredentials(ctx context.Context) bool {
-	var loggedMissing, loggedBroken bool
+	var loggedMissing, loggedBroken, loggedReporter bool
 	for {
 		creds, err := a.d.Store.LoadCredentials()
-		if err == nil {
+		if err == nil && a.loadReporter(&loggedReporter) {
 			a.creds = creds
 			a.status.ServerUUID = creds.ServerUUID
 			return true
 		}
 		missing := errors.Is(err, fs.ErrNotExist)
 		switch {
+		case err == nil:
+			// loadReporter failed and logged why.
 		case missing && !loggedMissing:
 			loggedMissing = true
 			a.log.Warn(notEnrolledMsg)
@@ -167,6 +181,26 @@ func (a *Agent) waitForCredentials(ctx context.Context) bool {
 	}
 }
 
+// loadReporter rebuilds the reporter with NewReporter, when set. A failure is
+// logged and written to the status file once per wait (*logged).
+func (a *Agent) loadReporter(logged *bool) bool {
+	if a.d.NewReporter == nil {
+		return true
+	}
+	reporter, err := a.d.NewReporter()
+	if err == nil {
+		a.reporter = reporter
+		return true
+	}
+	if !*logged {
+		*logged = true
+		a.log.Error("cannot load platform_url; retrying every 15s", "error", err)
+		a.status.LastError = "cannot load platform_url: " + err.Error()
+		a.writeStatus()
+	}
+	return false
+}
+
 // loadPlatformConfig restores the last applied config. An unreadable file
 // falls back to version 0 with no checks, so the platform resends the config.
 func (a *Agent) loadPlatformConfig() {
@@ -175,6 +209,7 @@ func (a *Agent) loadPlatformConfig() {
 		a.log.Error("cannot load platform config; starting from defaults", "error", err)
 		cfg = state.PlatformConfig{}
 	}
+	a.saved = cfg
 	a.configVersion = cfg.ConfigVersion
 	a.checks = nonNil(cfg.Checks)
 	a.interval = platform.ClampInterval(cfg.ReportIntervalSeconds, 0)
@@ -195,7 +230,7 @@ func (a *Agent) report(ctx context.Context) (string, error) {
 	wg.Wait()
 
 	sentAt := a.d.Now().UTC().Format(time.RFC3339)
-	resp, err := a.d.Reporter.Report(ctx, a.creds.AgentToken, wire.ReportRequest{
+	resp, err := a.reporter.Report(ctx, a.creds.AgentToken, wire.ReportRequest{
 		Schema:        wire.SchemaVersion,
 		AgentVersion:  buildinfo.Version,
 		SentAt:        sentAt,
@@ -211,7 +246,10 @@ func (a *Agent) report(ctx context.Context) (string, error) {
 }
 
 // apply takes the interval and, when present, the new config from a report
-// response. The config is used in memory even when persisting it fails.
+// response. The config is used in memory even when persisting it fails. It is
+// saved only when it differs from what the state file already holds, so a
+// platform that keeps resending the same config does not rewrite the file
+// (on Unraid, the flash drive) every report.
 func (a *Agent) apply(resp wire.ReportResponse) {
 	a.interval = platform.ClampInterval(resp.ReportIntervalSeconds, a.interval)
 	if resp.Config == nil {
@@ -219,16 +257,21 @@ func (a *Agent) apply(resp wire.ReportResponse) {
 	}
 	a.configVersion = resp.ConfigVersion
 	a.checks = nonNil(resp.Config.Checks)
-	a.log.Info("applied platform config", "config_version", a.configVersion, "checks", len(a.checks))
 
-	err := a.d.Store.SavePlatformConfig(state.PlatformConfig{
+	cfg := state.PlatformConfig{
 		ConfigVersion:         a.configVersion,
 		ReportIntervalSeconds: int(a.interval / time.Second),
 		Checks:                a.checks,
-	})
-	if err != nil {
-		a.log.Error("cannot persist platform config; using it until restart", "config_version", a.configVersion, "error", err)
 	}
+	if reflect.DeepEqual(cfg, a.saved) {
+		return
+	}
+	a.log.Info("applied platform config", "config_version", a.configVersion, "checks", len(a.checks))
+	if err := a.d.Store.SavePlatformConfig(cfg); err != nil {
+		a.log.Error("cannot persist platform config; using it until restart", "config_version", a.configVersion, "error", err)
+		return
+	}
+	a.saved = cfg
 }
 
 // recordOutcome logs a failed report and updates the status file. Nothing it
