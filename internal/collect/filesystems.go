@@ -195,7 +195,7 @@ func (c *FilesystemCollector) start(m Mount) chan statfsOutcome {
 	path := filepath.Join(c.Root, m.MountPoint)
 	outcome := make(chan statfsOutcome, 1)
 	go func() {
-		result, err := statfs(path)
+		result, err := recoverStatfs(c.logger(), statfs, path)
 		c.mu.Lock()
 		delete(c.inFlight, key)
 		c.mu.Unlock()
@@ -230,4 +230,17 @@ func (c *FilesystemCollector) logger() *slog.Logger {
 		return slog.Default()
 	}
 	return c.Logger
+}
+
+// recoverStatfs calls statfs and turns a panic into an error, so one mount
+// that makes it panic is reported as unresponsive instead of crashing the
+// agent.
+func recoverStatfs(logger *slog.Logger, statfs StatfsFunc, path string) (result StatfsResult, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			logPanic(logger, "filesystems", v)
+			result, err = StatfsResult{}, fmt.Errorf("statfs panicked: %v", v)
+		}
+	}()
+	return statfs(path)
 }

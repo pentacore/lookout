@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -92,6 +93,12 @@ func (d *DockerClient) Containers(ctx context.Context) ([]wire.Container, error)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			// A panic leaves this container without restart count and health.
+			defer func() {
+				if v := recover(); v != nil {
+					logPanic(slog.Default(), "containers", v)
+				}
+			}()
 			infos[i] = d.inspect(inspectCtx, entry.ID)
 		}()
 	}
