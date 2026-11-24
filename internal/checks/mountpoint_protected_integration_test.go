@@ -50,56 +50,93 @@ func TestIntegrationMountpointProtected(t *testing.T) {
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			path := tt.mount(t)
-			runtimeDir, peerDir := sharedRuntimeDir(t)
-			namespaceBefore := mainMountNamespace(t)
+	for _, mode := range inspectionModes(t) {
+		for _, tt := range tests {
+			t.Run(mode+"/"+tt.name, func(t *testing.T) {
+				useMode(mode)
+				path := tt.mount(t)
+				runtimeDir, peerDir := sharedRuntimeDir(t)
+				namespaceBefore := mainMountNamespace(t)
 
-			hookCalls := 0
-			inspectMountedHook = func(dir string) {
-				hookCalls++
+				hookCalls := 0
+				inspectMountedHook = func(gotMode string, mountFD int) {
+					hookCalls++
+					if gotMode != mode {
+						t.Errorf("inspection mode = %s, want %s", gotMode, mode)
+					}
+					assertNotInHostNamespace(t)
+					assertMountFlags(t, mountFD, unix.ST_RDONLY)
+				}
+				t.Cleanup(func() { inspectMountedHook = nil })
+
+				env := Env{
+					Root:       "/",
+					RuntimeDir: runtimeDir,
+					Mounts:     func() (collect.MountTable, error) { return collect.ReadMountTable("/") },
+					Now:        time.Now,
+				}
+
+				params, err := json.Marshal(map[string]string{"path": path})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				got := newMountpointProtected(inspectUnderlying).Run(context.Background(), env, params)
+
+				if got.Status != tt.wantStatus || got.Observed["immutable"] != tt.wantImmutable {
+					t.Errorf("got %q %v (%s), want %q immutable=%v",
+						got.Status, got.Observed, got.Message, tt.wantStatus, tt.wantImmutable)
+				}
+
+				if !strings.Contains(got.Message, tt.wantContains) {
+					t.Errorf("message = %q, want it to contain %q", got.Message, tt.wantContains)
+				}
+
+				if hookCalls != 1 {
+					t.Errorf("inspect reached the mounted state %d times, want 1", hookCalls)
+				}
+
+				if after := mainMountNamespace(t); after != namespaceBefore {
+					t.Errorf("main thread mount namespace changed from %s to %s", namespaceBefore, after)
+				}
+
+				assertNoLeftovers(t, runtimeDir)
+				assertNoLeftovers(t, peerDir)
 				assertNotInHostNamespace(t)
-				assertReadOnlyInPrivateNamespace(t, dir)
-			}
-			t.Cleanup(func() { inspectMountedHook = nil })
-
-			env := Env{
-				Root:       "/",
-				RuntimeDir: runtimeDir,
-				Mounts:     func() (collect.MountTable, error) { return collect.ReadMountTable("/") },
-				Now:        time.Now,
-			}
-
-			params, err := json.Marshal(map[string]string{"path": path})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			got := newMountpointProtected(inspectUnderlying).Run(context.Background(), env, params)
-
-			if got.Status != tt.wantStatus || got.Observed["immutable"] != tt.wantImmutable {
-				t.Errorf("got %q %v (%s), want %q immutable=%v",
-					got.Status, got.Observed, got.Message, tt.wantStatus, tt.wantImmutable)
-			}
-
-			if !strings.Contains(got.Message, tt.wantContains) {
-				t.Errorf("message = %q, want it to contain %q", got.Message, tt.wantContains)
-			}
-
-			if hookCalls != 1 {
-				t.Errorf("inspect reached the mounted state %d times, want 1", hookCalls)
-			}
-
-			if after := mainMountNamespace(t); after != namespaceBefore {
-				t.Errorf("main thread mount namespace changed from %s to %s", namespaceBefore, after)
-			}
-
-			assertNoLeftovers(t, runtimeDir)
-			assertNoLeftovers(t, peerDir)
-			assertNotInHostNamespace(t)
-		})
+			})
+		}
 	}
+}
+
+// inspectionModes lists the modes this kernel can run. Each one sets
+// forceNamespaceInspection for the subtests that follow it.
+func inspectionModes(t *testing.T) []string {
+	t.Helper()
+
+	t.Cleanup(func() { forceNamespaceInspection = false })
+
+	modes := []string{inspectNamespace}
+
+	tree, err := unix.OpenTree(unix.AT_FDCWD, "/", unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+	if err == nil {
+		_ = unix.Close(tree)
+
+		var attr unix.MountAttr
+		if unix.MountSetattr(-1, "", 0, &attr) != unix.ENOSYS {
+			modes = append(modes, inspectDetached)
+		}
+	}
+
+	if len(modes) == 1 {
+		t.Logf("kernel lacks open_tree or mount_setattr; testing the namespace mode only")
+	}
+
+	return modes
+}
+
+// useMode makes inspectUnderlying take mode's path.
+func useMode(mode string) {
+	forceNamespaceInspection = mode == inspectNamespace
 }
 
 // mountOverDir mounts tmpfs at base/parent, creates base/parent/mp (with
@@ -260,23 +297,21 @@ func assertNotInHostNamespace(t *testing.T) {
 	}
 }
 
-// assertReadOnlyInPrivateNamespace fails unless the calling thread's
-// namespace has dir mounted read-only.
-func assertReadOnlyInPrivateNamespace(t *testing.T, dir string) {
+// assertMountFlags fails unless the mount mountFD belongs to has every
+// statfs flag in want.
+func assertMountFlags(t *testing.T, mountFD int, want uint64) {
 	t.Helper()
 
-	for _, line := range mountInfoLines(t, "/proc/thread-self/mountinfo") {
-		fields := strings.Fields(line)
-		if len(fields) > 5 && collect.Unescape(fields[4]) == dir {
-			if !strings.HasPrefix(fields[5], "ro") {
-				t.Errorf("inspection mount is not read-only: %s", line)
-			}
+	var st unix.Statfs_t
+	if err := unix.Fstatfs(mountFD, &st); err != nil {
+		t.Errorf("fstatfs the inspection mount: %v", err)
 
-			return
-		}
+		return
 	}
 
-	t.Errorf("inspection mount %s not found in the private namespace", dir)
+	if got := uint64(st.Flags); got&want != want {
+		t.Errorf("inspection mount flags = %#x, want %#x set", got, want)
+	}
 }
 
 func mountInfoLines(t *testing.T, path string) []string {
@@ -327,7 +362,7 @@ func TestIntegrationMountpointProtectedHungInspection(t *testing.T) {
 
 	release := make(chan struct{})
 	hookCalls := make(chan struct{}, 10)
-	inspectMountedHook = func(string) {
+	inspectMountedHook = func(string, int) {
 		hookCalls <- struct{}{}
 		<-release
 	}
@@ -379,4 +414,165 @@ func TestIntegrationMountpointProtectedHungInspection(t *testing.T) {
 
 	assertNoLeftovers(t, runtimeDir)
 	assertNotInHostNamespace(t)
+}
+
+// The read-only copy keeps the parent's nosuid, nodev, noexec and noatime.
+// A bind remount that dropped them fails with EPERM where they are locked (a
+// user namespace or an LXC container).
+func TestIntegrationMountpointProtectedKeepsMountFlags(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to mount tmpfs and bind mounts")
+	}
+
+	for _, mode := range inspectionModes(t) {
+		t.Run(mode, func(t *testing.T) {
+			useMode(mode)
+
+			parent := filepath.Join(t.TempDir(), "parent")
+			if err := os.MkdirAll(parent, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			flags := uintptr(unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC | unix.MS_NOATIME)
+			if err := unix.Mount("tmpfs", parent, "tmpfs", flags, ""); err != nil {
+				t.Fatalf("mount tmpfs at %s: %v", parent, err)
+			}
+
+			t.Cleanup(func() { mustUnmount(t, parent) })
+
+			mp := filepath.Join(parent, "mp")
+			if err := os.Mkdir(mp, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			mountTmpfs(t, mp)
+
+			runtimeDir, _ := sharedRuntimeDir(t)
+
+			inspectMountedHook = func(_ string, mountFD int) {
+				assertMountFlags(t, mountFD, unix.ST_RDONLY|unix.ST_NOSUID|unix.ST_NODEV|unix.ST_NOEXEC|unix.ST_NOATIME)
+			}
+			t.Cleanup(func() { inspectMountedHook = nil })
+
+			env := Env{
+				Root:       "/",
+				RuntimeDir: runtimeDir,
+				Mounts:     func() (collect.MountTable, error) { return collect.ReadMountTable("/") },
+				Now:        time.Now,
+			}
+
+			params, err := json.Marshal(map[string]string{"path": mp})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got := newMountpointProtected(inspectUnderlying).Run(context.Background(), env, params)
+			if got.Status != wire.StatusWarn {
+				t.Errorf("got %q (%s), want warn", got.Status, got.Message)
+			}
+		})
+	}
+}
+
+// A hung inspection must not keep other host filesystems busy: once the host
+// unmounts one, no thread of the agent may still have it mounted. On Unraid
+// a pinned array disk cannot be released when the array stops.
+func TestIntegrationMountpointProtectedHungInspectionDoesNotPinMounts(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to mount tmpfs and bind mounts")
+	}
+
+	for _, mode := range inspectionModes(t) {
+		t.Run(mode, func(t *testing.T) {
+			useMode(mode)
+
+			path := mountOverDir(t, false)
+			runtimeDir, _ := sharedRuntimeDir(t)
+
+			// An unrelated filesystem below a shared mount, as systemd sets
+			// up the host: an unmount there propagates to its peers and slaves.
+			base := mountTmpfs(t, filepath.Join(t.TempDir(), "base"))
+			if err := unix.Mount("", base, "", unix.MS_SHARED, ""); err != nil {
+				t.Fatalf("make %s shared: %v", base, err)
+			}
+
+			other := filepath.Join(base, "other")
+			if err := os.Mkdir(other, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := unix.Mount("tmpfs", other, "tmpfs", 0, "size=1m"); err != nil {
+				t.Fatalf("mount tmpfs at %s: %v", other, err)
+			}
+
+			mounted := make(chan struct{})
+			release := make(chan struct{})
+			inspectMountedHook = func(string, int) {
+				close(mounted)
+				<-release
+			}
+			t.Cleanup(func() { inspectMountedHook = nil })
+
+			env := Env{
+				Root:       "/",
+				RuntimeDir: runtimeDir,
+				Mounts:     func() (collect.MountTable, error) { return collect.ReadMountTable("/") },
+				Now:        time.Now,
+			}
+
+			params, err := json.Marshal(map[string]string{"path": path})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			done := make(chan Outcome, 1)
+
+			go func() {
+				done <- newMountpointProtected(inspectUnderlying).Run(context.Background(), env, params)
+			}()
+
+			select {
+			case <-mounted:
+			case <-time.After(5 * time.Second):
+				close(release)
+				t.Fatal("inspection did not start")
+			}
+
+			if err := unix.Unmount(other, 0); err != nil {
+				close(release)
+				t.Fatalf("unmount %s while an inspection hangs: %v", other, err)
+			}
+
+			for _, task := range taskMountInfos(t) {
+				for _, line := range mountInfoLines(t, task) {
+					if fields := strings.Fields(line); len(fields) > 4 && collect.Unescape(fields[4]) == other {
+						t.Errorf("%s still has %s mounted after the host unmounted it: %s", task, other, line)
+					}
+				}
+			}
+
+			close(release)
+
+			select {
+			case got := <-done:
+				if got.Status != wire.StatusWarn {
+					t.Errorf("got %q (%s), want warn", got.Status, got.Message)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("inspection did not finish after release")
+			}
+		})
+	}
+}
+
+// taskMountInfos lists the mountinfo file of every thread of this process.
+func taskMountInfos(t *testing.T) []string {
+	t.Helper()
+
+	paths, err := filepath.Glob("/proc/self/task/*/mountinfo")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("list thread mountinfo files: %v", err)
+	}
+
+	return paths
 }

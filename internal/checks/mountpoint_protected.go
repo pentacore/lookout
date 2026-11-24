@@ -14,8 +14,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// mountpointProtectedTTL bounds how often one path is bind-mounted and
-// inspected: the underlying directory only changes while the mount is down.
+// mountpointProtectedTTL bounds how often the directory under one mount point
+// is inspected: the underlying directory only changes while the mount is down.
 const mountpointProtectedTTL = 15 * time.Minute
 
 // sharedMountpointProtected is the instance DefaultRegistry hands out, so the
