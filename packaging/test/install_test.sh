@@ -103,6 +103,8 @@ case "$1" in
 version) echo "lookout 0.1.0" ;;
 check-config)
 	if [ -n "${FAKE_CHECK_CONFIG_RC:-}" ]; then echo "config exploded" >&2; exit "$FAKE_CHECK_CONFIG_RC"; fi
+	# Like the real binary: an empty platform_url does not validate.
+	if ! grep -q '^platform_url: *[^ "'"'"']' "$3"; then echo "lookout check-config: platform_url is required" >&2; exit 1; fi
 	if [ -f "$LOOKOUT_DESTDIR/enrolled" ]; then echo "enrolled:     yes (server abc)"; else echo "enrolled:     no"; fi
 	;;
 enroll)
@@ -340,5 +342,79 @@ assert_eq "run10 status" 0 $?
 assert_contains "run10 latest" "/releases/latest/download/lookout_linux_amd64.tar.gz" "$(cat "$work/run10/curl")"
 assert_contains "run10 no key warning" "no signing key in this script; verified sha256 only" "$(cat "$work/run10/stderr")"
 [ ! -s "$work/run10/minisign" ] || fail "run10 must not run minisign without a key"
+
+# make_release DIR VERSION_SCRIPT packs a fake release whose binary answers
+# `version` with VERSION_SCRIPT and otherwise behaves like the normal fake.
+make_release() {
+	mr_dir="$1"
+	mkdir -p "$mr_dir/pkg"
+	{
+		cat <<'FAKE'
+#!/bin/sh
+if [ "$1" = version ]; then
+FAKE
+		printf '%s\n' "$2"
+		cat <<'FAKE'
+fi
+exec "$FAKE_REAL" "$@"
+FAKE
+	} >"$mr_dir/pkg/lookout"
+	chmod +x "$mr_dir/pkg/lookout"
+	tar -czf "$mr_dir/lookout_linux_amd64.tar.gz" -C "$mr_dir/pkg" lookout
+	printf 'sig' >"$mr_dir/lookout_linux_amd64.tar.gz.minisig"
+	printf '%s  lookout_linux_amd64.tar.gz\n' "$(sha256_of "$mr_dir/lookout_linux_amd64.tar.gz")" >"$mr_dir/checksums.txt"
+}
+FAKE_REAL="$fx/release/pkg/lookout"
+export FAKE_REAL
+
+# The extracted binary must run, and report the pinned version, before it
+# replaces the installed one: a binary for the wrong machine or a truncated
+# one would otherwise leave the host without a working agent.
+make_release "$fx/release-broken" 'echo "cannot execute binary file" >&2; exit 126'
+make_release "$fx/release-wrongver" 'echo "lookout 0.0.9"; exit 0'
+for bad in broken wrongver; do
+	cp -R "$work/run1/root" "$work/$bad-root"
+	printf '#!/bin/sh\necho "lookout 0.0.1"\n' >"$work/$bad-root/usr/local/bin/lookout"
+	mkdir -p "$work/run19-$bad"
+	: >"$work/run19-$bad/systemctl"
+	(
+		unset LOOKOUT_INSTALL_LIB_ONLY
+		PATH="$withminisign" LOOKOUT_DESTDIR="$work/$bad-root" LOOKOUT_UNAME_M=x86_64 \
+			FAKE_LOG="$work/run19-$bad" FAKE_RELEASE="$fx/release-$bad" \
+			sh "$work/out/install.sh"
+	) >"$work/run19-$bad/stdout" 2>"$work/run19-$bad/stderr"
+	rc=$?
+	[ "$rc" -ne 0 ] || fail "run19 $bad must fail"
+	assert_eq "run19 $bad old binary kept" "lookout 0.0.1" "$("$work/$bad-root/usr/local/bin/lookout" version)"
+	[ ! -e "$work/$bad-root/usr/local/bin/lookout.new" ] || fail "run19 $bad left lookout.new behind"
+	assert_eq "run19 $bad no systemctl" "" "$(cat "$work/run19-$bad/systemctl")"
+done
+assert_contains "run19 broken message" "the downloaded lookout does not run on this machine" "$(cat "$work/run19-broken/stderr")"
+assert_contains "run19 wrong version message" "reports [lookout 0.0.9], want [lookout 0.1.0]" "$(cat "$work/run19-wrongver/stderr")"
+
+# An existing config whose platform_url is empty (as left by hand or by an
+# earlier failed install) takes --url like a first install: enroll writes it.
+mkdir -p "$work/empty-root/etc/lookout"
+printf 'platform_url: ""\nstate_dir: /var/lib/lookout\n' >"$work/empty-root/etc/lookout/lookout.yaml"
+run_install_root "$work/run20" "$work/empty-root" --url https://media.example.com --token T4
+assert_eq "run20 status" 0 $?
+assert_contains "run20 enroll" "--url https://media.example.com token=T4" "$(cat "$work/empty-root/calls")"
+assert_not_contains "run20 no force" "--force" "$(cat "$work/empty-root/calls")"
+assert_eq "run20 config left to enroll" 'platform_url: ""
+state_dir: /var/lib/lookout' "$(cat "$work/empty-root/etc/lookout/lookout.yaml")"
+
+# Credentials next to an empty platform_url: which platform issued them is
+# unknown, so --url without a token is refused and with one re-enrolls.
+mkdir -p "$work/empty-enrolled-root/etc/lookout"
+printf 'state_dir: /var/lib/lookout\n' >"$work/empty-enrolled-root/etc/lookout/lookout.yaml"
+: >"$work/empty-enrolled-root/enrolled"
+if run_install_root "$work/run21" "$work/empty-enrolled-root" --url https://media.example.com; then
+	fail "run21 must refuse --url without a token next to existing credentials"
+fi
+assert_contains "run21 message" "pass --token or LOOKOUT_TOKEN to re-enroll" "$(cat "$work/run21/stderr")"
+assert_eq "run21 config unchanged" "state_dir: /var/lib/lookout" "$(cat "$work/empty-enrolled-root/etc/lookout/lookout.yaml")"
+run_install_root "$work/run22" "$work/empty-enrolled-root" --url https://media.example.com --token T5
+assert_eq "run22 status" 0 $?
+assert_contains "run22 enroll" "--url https://media.example.com --force token=T5" "$(cat "$work/empty-enrolled-root/calls")"
 
 echo "install_test: ok"
